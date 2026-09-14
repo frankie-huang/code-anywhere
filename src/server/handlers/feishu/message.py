@@ -38,19 +38,15 @@ def _send_text_message(service, chat_id: str, text: str, reply_to: Optional[str]
         service: FeishuAPIService 实例
         chat_id: 群聊 ID
         text: 消息内容
-        reply_to: 要回复的消息 ID（可选），设置后使用回复 API
+        reply_to: 要回复的消息 ID（可选），设置后使用回复 API，失败时降级为按 chat_id 发送
         reply_in_thread: 是否收进话题详情
 
     Returns:
         (success, message_id): 成功时返回 (True, message_id)，失败时返回 (False, '')
     """
     try:
-        if reply_to:
-            # 使用回复消息 API
-            success, message_id = service.reply_text(text, reply_to, reply_in_thread)
-        else:
-            # 使用发送新消息 API
-            success, message_id = service.send_text(text, receive_id=chat_id, receive_id_type='chat_id')
+        success, message_id = service.reply_or_send_text(
+            text, chat_id, 'chat_id', reply_to, reply_in_thread)
 
         if success:
             logger.info(f"[feishu] Sent notification to {chat_id}: {_sanitize_user_content(text)}, reply_to={reply_to if reply_to else ''}")
@@ -105,14 +101,14 @@ def _send_session_result_notification(chat_id: str, response: dict, project_dir:
     """
     from services.feishu_api import FeishuAPIService
     from stores.message_session_store import MessageSessionStore
-    from agents import get_agent_adapter
+    from agents import get_agent_display_name
 
     service = FeishuAPIService.get_instance()
     if not service or not service.enabled:
         logger.error("[feishu] FeishuAPIService not enabled, skipping notification")
         return
 
-    agent_display = get_agent_adapter(agent_type or None).display_name
+    agent_display = get_agent_display_name(agent_type)
     status = response.get('status', '')
     error = response.get('error', '')
     session_id = response.get('session_id', '')
@@ -171,7 +167,8 @@ def _send_session_result_notification(chat_id: str, response: dict, project_dir:
 
     elif status == 'completed':
         if response.get('notification_handled'):
-            # 通知已由 callback 侧的 on_complete 回调处理（如 /compact），网关无需再发
+            # 通知已由 callback 侧回调处理（/compact 的 on_complete、
+            # 撞锁降级 codex queue 的 📌 提示），网关无需再发
             return
         # 快速完成
         output = response.get('output', '')
@@ -373,11 +370,7 @@ def _send_help_card(binding: Optional[Dict[str, Any]], chat_id: str,
     }
 
     card_json = json.dumps(card, ensure_ascii=False)
-    success = False
-    if reply_to:
-        success, _ = service.reply_card(card_json, reply_to)
-    else:
-        success, _ = service.send_card(card_json, receive_id=chat_id, receive_id_type='chat_id')
+    success, _ = service.reply_or_send_card(card_json, chat_id, 'chat_id', reply_to)
 
     if not success:
         logger.error("[feishu] Failed to send help card, fallback to text")
@@ -401,8 +394,8 @@ def _build_creating_session_card(selected_dir: str, prompt: str, command: str = 
     Returns:
         卡片字典（包含 type 和 data）
     """
-    from agents import get_agent_adapter
-    agent_display = get_agent_adapter(agent_type or None).display_name
+    from agents import get_agent_display_name
+    agent_display = get_agent_display_name(agent_type)
 
     elements = [
         {
@@ -570,10 +563,7 @@ def _send_users_status_card(chat_id: str, card: dict, reply_to: str):
         return
 
     card_json = json.dumps(card, ensure_ascii=False)
-    if reply_to:
-        success, _ = service.reply_card(card_json, reply_to)
-    else:
-        success, _ = service.send_card(card_json, receive_id=chat_id, receive_id_type='chat_id')
+    success, _ = service.reply_or_send_card(card_json, chat_id, 'chat_id', reply_to)
 
     if not success:
         logger.error("[feishu] Failed to send user status card, fallback to text")

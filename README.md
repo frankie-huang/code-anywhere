@@ -47,7 +47,10 @@ code-anywhere/
 │   │   └── stop.sh             # 任务完成通知处理（Stop 事件）
 │   ├── lib/                    # Shell 函数库
 │   │   ├── core.sh             # 核心库（路径、环境、日志）
+│   │   ├── im.sh               # IM 平台路由层（按 IM_PLATFORM 加载平台实现）
+│   │   ├── callback.sh         # Callback 后端客户端（HTTP/凭证/网关地址，平台无关）
 │   │   ├── json.sh             # JSON 解析（jq/python3/grep 降级）
+│   │   ├── transcript.sh       # transcript 答复提取库（Stop hook 使用，支持 CLI 直调）
 │   │   ├── tool.sh             # 工具详情格式化
 │   │   ├── tool-config.sh      # 工具配置加载
 │   │   ├── feishu.sh           # 飞书卡片构建和发送
@@ -62,6 +65,11 @@ code-anywhere/
 │   │   │   ├── __init__.py     # AgentAdapter 基类、工厂、共享启动逻辑
 │   │   │   ├── claude.py       # Claude Code CLI 适配器
 │   │   │   └── codex.py        # OpenAI Codex CLI 适配器
+│   │   ├── platforms/          # IM 平台适配层（平台无关接口 + 飞书实现）
+│   │   │   ├── base.py         # IMAdapter 接口 + GroupCapable 群聊能力混入
+│   │   │   ├── models.py       # 入站事件中立模型（IMEvent）
+│   │   │   ├── feishu_adapter.py # 飞书平台实现
+│   │   │   └── __init__.py     # 工厂（按 IM_PLATFORM 实例化，默认 feishu）
 │   │   ├── services/           # 业务服务
 │   │   │   ├── request_manager.py   # 请求管理器
 │   │   │   ├── decision_handler.py  # 决策处理器
@@ -73,7 +81,10 @@ code-anywhere/
 │   │   │   ├── feishu_api.py        # 飞书 API 封装
 │   │   │   ├── feishu_longpoll.py   # 飞书 WebSocket 长连接服务
 │   │   │   ├── ws_registry.py       # WebSocket 连接注册
-│   │   │   └── ws_tunnel_client.py  # WebSocket 隧道客户端
+│   │   │   ├── ws_tunnel_client.py  # WebSocket 隧道客户端
+│   │   │   ├── callback_client.py   # 网关→Callback 传输（WS 隧道/HTTP 双通道）
+│   │   │   ├── gateway_client.py    # Callback→网关 传输
+│   │   │   └── group_maintenance.py # 群聊维护编排（平台无关）
 │   │   ├── stores/             # JSON 持久化单例 store（统一 JsonStore 基类）
 │   │   │   ├── json_store.py        # JSON 持久化单例基类（各 store 共用）
 │   │   │   ├── message_session_store.py # Message-Session 映射存储
@@ -91,7 +102,7 @@ code-anywhere/
 │   │   │   ├── register.py     # 网关注册处理器
 │   │   │   ├── ws_handler.py   # WebSocket 连接处理器
 │   │   │   ├── permission_mcp.py # MCP 权限审批服务（headless 模式）
-│   │   │   ├── outbound.py     # 飞书出站门面（reply/建群/移除 typing）
+│   │   │   ├── outbound.py     # IM 出站门面（平台无关，转发 adapter.cb_*）
 │   │   │   └── responses.py    # HTTP 响应写回（send_json/send_html）
 │   │   ├── telemetry/          # 遥测服务
 │   │   │   ├── client.py       # 遥测数据上报客户端
@@ -201,7 +212,7 @@ vim .env
 |------|----------|------|
 | **Webhook** | `FEISHU_WEBHOOK_URL` | 默认模式，快速开始 |
 | **OpenAPI 单机** | `FEISHU_APP_ID` + `FEISHU_APP_SECRET` + `FEISHU_OWNER_ID` | 飞书内响应 |
-| **OpenAPI 分离** | `FEISHU_GATEWAY_URL` | 多实例部署 |
+| **OpenAPI 分离** | `GATEWAY_URL` | 多实例部署 |
 
 > 详细的模式对比、架构设计和配置指南请参考 [部署模式架构文档](docs/deploy/DEPLOYMENT_MODES.md)
 
@@ -407,7 +418,7 @@ Callback 通过 WebSocket 长连接主动接入网关，无需公网 IP，适合
 | `src/hooks/user_prompt.sh` | 用户 Prompt 同步到飞书 | UserPromptSubmit |
 | `src/hooks/permission.sh` | 权限请求处理（可交互） | PermissionRequest |
 | `src/hooks/stop.sh` | 任务完成通知（含响应摘要） | Stop |
-| `src/server/main.py` | 权限回调服务（HTTP + Socket） | - |
+| `src/server/main.py` | 回调服务（HTTP + Socket） | - |
 | `src/server/socket_client.py` | Socket 客户端（替代 socat） | - |
 | `src/server/handlers/agent.py` | Agent 会话处理器（新建/继续） | - |
 | `src/server/stores/message_session_store.py` | Message-Session 映射存储服务 | - |
@@ -418,6 +429,7 @@ Callback 通过 WebSocket 长连接主动接入网关，无需公网 IP，适合
 |--------|------|
 | `src/lib/core.sh` | 核心库：路径管理、环境配置、日志记录 |
 | `src/lib/json.sh` | JSON 解析函数（支持 jq/python3/grep+sed 多级降级） |
+| `src/lib/transcript.sh` | transcript 答复提取库（Stop hook 使用，支持 CLI 直调） |
 | `src/lib/tool.sh` | 工具详情格式化 |
 | `src/lib/tool-config.sh` | 工具配置加载（读取 config/tools.json） |
 | `src/lib/feishu.sh` | 飞书卡片构建和发送（支持 session_id/project_dir/callback_url 参数） |
@@ -433,6 +445,17 @@ Callback 通过 WebSocket 长连接主动接入网关，无需公网 IP，适合
 | `decision.py` | 用户决策数据模型 |
 | `tool_config.py` | 工具配置数据模型（从 config/tools.json 读取） |
 
+### IM 平台适配层 (`src/server/platforms/`)
+
+业务层只消费平台无关接口（`get_im_adapter()` 工厂获取实例，按 `IM_PLATFORM` 配置选择平台），不接触具体 IM 平台的报文与 API。新增平台：实现 adapter + 工厂注册一行，业务层零改动。
+
+| 模块 | 功能 |
+|------|------|
+| `base.py` | `IMAdapter` 抽象基类（生命周期 / 出站 `cb_*` / 注册授权 / 入站事件解析 / 网关端点声明，接口按强制力分四档）+ `GroupCapable` 群聊能力混入 |
+| `models.py` | 入站事件中立模型 `IMEvent`（消息 / 卡片回调共用，业务层统一消费） |
+| `feishu_adapter.py` | 飞书平台实现（单机直发 / 分离经网关由 adapter 内部决定） |
+| `__init__.py` | 工厂 `get_im_adapter()`（按 `IM_PLATFORM` 实例化，默认 feishu） |
+
 ### 业务服务 (`src/server/services/`)
 
 | 服务 | 功能 |
@@ -443,7 +466,14 @@ Callback 通过 WebSocket 长连接主动接入网关，无需公网 IP，适合
 | `auto_register.py` | 网关注册服务（Callback 自动向网关注册） |
 | `auth_token.py` | 认证令牌管理（生成、验证、刷新） |
 | `feishu_api.py` | 飞书 API 封装（发送消息、上传图片等） |
-| `feishu_longpoll.py` | 飞书 WebSocket 长连接服务（lark-oapi SDK） |
+| `feishu_longpoll.py` | 飞书 WebSocket 长连接服务（lark-oapi SDK，事件入口由适配层注入） |
+| `session_facade.py` | 会话操作门面（路由 / 生命周期 / 静音透传） |
+| `callback_client.py` | 网关→Callback 传输（WS 隧道/HTTP 双通道 + 注册通知） |
+| `gateway_client.py` | Callback→网关 传输 |
+| `group_maintenance.py` | 群聊维护编排（空闲群发现、批量解散，平台无关） |
+| `ws_registry.py` | WebSocket 连接注册 |
+| `ws_tunnel_client.py` | WebSocket 隧道客户端 |
+| `card_cache.py` | 卡片消息缓存 |
 
 ### Store 持久化 (`src/server/stores/`)
 
@@ -468,9 +498,10 @@ Callback 通过 WebSocket 长连接主动接入网关，无需公网 IP，适合
 | `callback.py` | 权限回调处理器（接收按钮操作） | `/cb/*` |
 | `feishu/` | 飞书事件处理器包（OpenAPI 网关） | `/gw/feishu/*` |
 | `agent.py` | Agent 会话处理器 | `/cb/agent/new`, `/cb/agent/continue` |
-| `register.py` | 网关注册处理器 | `/gw/register` |
+| `register.py` | 网关注册处理器（平台无关编排） | `/gw/register` |
+| `ws_handler.py` | WebSocket 隧道处理器（Callback 主动连网关） | `/ws/tunnel` |
 | `permission_mcp.py` | MCP 权限审批服务（headless 模式） | MCP stdio |
-| `outbound.py` | 飞书出站门面（reply 文本/卡片、移除 typing、建群） | - |
+| `outbound.py` | IM 出站门面（平台无关：reply 文本/卡片、typing、建群，转发 `adapter.cb_*`） | - |
 | `responses.py` | HTTP 响应写回（send_json / send_html_response） | - |
 
 ## VSCode SSH 远程开发代理
@@ -670,21 +701,23 @@ export FEISHU_WEBHOOK_URL="https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxx"
 
 **OpenAPI 模式 — 网关（分离部署）**
 
-配置 `FEISHU_GATEWAY_URL` 后启用分离部署：
+配置 `GATEWAY_URL` 后启用分离部署：
 
 - 网关服务配置：`FEISHU_APP_ID`、`FEISHU_APP_SECRET`
-- Callback 服务配置：`FEISHU_GATEWAY_URL`（不配置则默认使用 `CALLBACK_SERVER_URL`，协议头决定连接模式）
+- Callback 服务配置：`GATEWAY_URL`（不配置则默认使用 `CALLBACK_SERVER_URL`，协议头决定连接模式）
 - Callback 服务启动时自动向网关注册获取 `auth_token`（用于后续通信验证）
 
 | 变量 | 网关服务 | Callback 服务 |
 |------|:-------:|:------------:|
-| `FEISHU_GATEWAY_URL` | - | ✓（分离部署必需） |
+| `GATEWAY_URL` | - | ✓（分离部署必需） |
 | `FEISHU_APP_ID` | ✓ | - |
 | `FEISHU_APP_SECRET` | ✓ | - |
 | `FEISHU_VERIFICATION_TOKEN` | ✓（HTTP 回调模式） | - |
 | `FEISHU_EVENT_MODE` | ✓（可选，一般无需配置） | - |
 | `FEISHU_OWNER_ID` | ✓ | ✓ |
 | `FEISHU_CHAT_ID` | ✓ | ✓（客户端读取） |
+
+> **升级提示**：旧键名 `FEISHU_GATEWAY_URL` 仍然生效（两者都配时 `GATEWAY_URL` 优先），老配置无需改动即可继续运行。
 
 **连接模式选择**：
 
@@ -707,20 +740,20 @@ FEISHU_OWNER_ID=ou_admin_user
 
 # === Callback 服务（WS 隧道模式，推荐）===
 FEISHU_SEND_MODE=openapi
-FEISHU_GATEWAY_URL=ws://gateway-server:8080  # 使用 ws:// 协议头启用 WS 隧道
+GATEWAY_URL=ws://gateway-server:8080  # 使用 ws:// 协议头启用 WS 隧道
 CALLBACK_SERVER_URL=http://localhost:8081    # 本地开发无需公网可达
 CALLBACK_SERVER_PORT=8081
 FEISHU_OWNER_ID=ou_admin_user
 
 # === Callback 服务（HTTP 回调模式）===
 FEISHU_SEND_MODE=openapi
-FEISHU_GATEWAY_URL=http://gateway-server:8080  # 使用 http:// 协议头
+GATEWAY_URL=http://gateway-server:8080  # 使用 http:// 协议头
 CALLBACK_SERVER_URL=http://callback-server-a:8081  # 需要公网可达
 CALLBACK_SERVER_PORT=8081
 FEISHU_OWNER_ID=ou_admin_user
 ```
 
-> **协议头说明**：`FEISHU_GATEWAY_URL` 的协议头决定连接模式
+> **协议头说明**：`GATEWAY_URL` 的协议头决定连接模式
 > - `ws://` 或 `wss://` → WS 隧道模式（Callback 无需公网可达，本地开发推荐）
 > - `http://` 或 `https://` → HTTP 回调模式（Callback 需公网可达）
 
@@ -961,11 +994,14 @@ brew install python3 curl jq socat
 | `/new --dir=/path prompt` | 直接指定目录和提示词创建会话 |
 | `/new --cmd=1 --dir=/path prompt` | 指定 Agent Command（按索引或名称子串） |
 | `/reply --cmd=opus prompt` | 回复消息时指定 Command 继续会话 |
+| `/copy` | 复制会话最后一条答复为 markdown 代码块（不截断、未经卡片渲染） |
 | `/init` | 为当前项目生成 CLAUDE.md 配置文件（Agent 指令） |
 | `/compact` | 压缩当前会话的上下文窗口（Agent 指令） |
 | `/context` | 查看当前会话的 token 用量分布（Agent 指令） |
 | `/review` | 对当前工作区的代码变更进行审查（Agent 指令） |
 | `/simplify` | 审查变更代码的复用、质量和效率（Agent 指令） |
+
+> 完整指令列表（含 `/stop`、`/mute`、`/groups`、`/notify` 等管理指令）可在飞书发送 `/help` 查看。
 
 - `/reply` 仅在回复消息时可用，用于临时切换 Command 继续会话
 - 未指定 `--cmd` 时，使用 session 记忆的 Command 或默认命令

@@ -7,6 +7,7 @@
     - /cb/session/ensure-chat（group 模式懒创建群聊）
     - /cb/session/get-info（按 session_id 返回权威字段，含 dissolved 状态）
     - /cb/session/mute
+    - /cb/session/set-meta（hook 上报会话元数据：env 快照 + transcript 路径）
     - /cb/session/invalidate-chats（gateway 解散群后调用，标记所有引用该 chat_id 的记录为 dissolved 状态）
 
 维护 session_id → session 语义数据（chat_id、command、dissolved、muted_at、活跃时间等）。
@@ -47,6 +48,7 @@ class SessionChatStore(JsonStore):
                 "agent_type": "claude",            # agent 类型: 'claude' / 'codex'（旧数据可能缺失，默认视为 claude）
                 "command": "claude",               # 使用的命令（可选）
                 "last_message_id": "om_xxx",       # 链式回复锚点（可选）
+                "transcript_path": "/x.jsonl",     # 会话 transcript 文件路径（可选，hook 上报，事后提取答复用）
                 "skip_next_user_prompt": true,     # 跳过下一条 UserPromptSubmit（飞书发起时设置，可选）
                 "updated_at": 1706745600,          # 最近更新时间戳
                 "project_dir": "/path/to/project", # 项目目录（可选）
@@ -383,6 +385,51 @@ class SessionChatStore(JsonStore):
             return {}
         return env
 
+    def set_transcript_path(self, session_id: str, transcript_path: str) -> bool:
+        """记录该 session 的 transcript 文件路径
+
+        hook 每次 trigger 时上报（report_session_meta），幂等覆盖；
+        /compact 等导致文件切换时自动跟上最新路径。空串清空字段
+        （hook 侧只在路径非空时上报该字段，清空为接口契约保留；
+        不校验文件存在性——新会话首次上报时文件可能尚未创建）。
+
+        与 set_env_overrides 同语义：不存在的 session 返回 False，
+        不创建占位记录（避免干扰 do_ensure_chat 的存在性判断）。
+
+        Args:
+            session_id: 会话 ID
+            transcript_path: transcript 文件绝对路径；空串视为清空
+
+        Returns:
+            是否成功写入；session 不存在时返回 False
+        """
+        if not session_id:
+            return False
+        with self._file_lock:
+            try:
+                data = self._load()
+                item = data.get(session_id)
+                if not item:
+                    return False
+                if transcript_path:
+                    if item.get('transcript_path') == transcript_path:
+                        return True
+                    item['transcript_path'] = transcript_path
+                else:
+                    if 'transcript_path' not in item:
+                        return True
+                    del item['transcript_path']
+                item['updated_at'] = int(time.time())
+                data[session_id] = item
+                if not self._save(data):
+                    return False
+                logger.info("[session-chat-store] Set transcript_path: session=%s, path=%s",
+                            session_id, transcript_path)
+                return True
+            except Exception as e:
+                logger.error("[session-chat-store] Failed to set transcript_path: %s", e)
+                return False
+
     def check_and_clear_skip_user_prompt(self, session_id: str) -> bool:
         """原子检查并清除 skip_next_user_prompt 标志
 
@@ -618,6 +665,25 @@ class SessionChatStore(JsonStore):
         """
         item = self.get_session(session_id)
         return item.get('last_message_id', '') if item else ''
+
+    def get_transcript_path(self, session_id: str) -> Optional[str]:
+        """获取 session 的 transcript 文件路径（三态，与 get_last_message_id
+        的差异在于调用方需要区分「会话不存在」与「路径未记录」两种提示）。
+
+        dissolved 不过滤：群解散只是会话的群聊层失效，transcript 文件
+        仍然有效——continue 路径同样以 include_dissolved=True 读取（可
+        复活），只读的 /copy 对已解散群的会话照常服务。过期仍视为不存在
+        （与 continue 的过期判定同口径）。
+
+        Returns:
+            None：session 不存在 / 过期
+            ''：session 存在但未记录路径
+            路径字符串：正常
+        """
+        item = self.get_session(session_id, include_dissolved=True)
+        if item is None:
+            return None
+        return item.get('transcript_path', '')
 
     def get_all(self) -> Dict[str, Dict[str, Any]]:
         """返回所有 session 的浅拷贝（不做过滤）"""

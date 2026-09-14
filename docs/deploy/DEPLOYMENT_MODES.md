@@ -197,7 +197,7 @@ FEISHU_OWNER_ID=ou_admin
 **Callback 服务（本地电脑）**：
 ```bash
 FEISHU_SEND_MODE=openapi
-FEISHU_GATEWAY_URL=ws://gateway-server:8080  # ws:// 启用 WS 隧道
+GATEWAY_URL=ws://gateway-server:8080  # ws:// 启用 WS 隧道
 FEISHU_OWNER_ID=ou_user_a
 ```
 

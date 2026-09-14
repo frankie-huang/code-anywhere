@@ -8,9 +8,13 @@ import urllib.request
 
 from typing import Any, Dict, Optional
 
+# 出站 HTTP 请求默认超时（秒）。各服务的请求超时统一从此取值，
+# 避免多处本地重复声明后各自漂移
+DEFAULT_HTTP_TIMEOUT = 10
+
 
 def post_json(url: str, data: Dict[str, Any], headers: Optional[Dict[str, str]] = None,
-              timeout: int = 10) -> Dict[str, Any]:
+              timeout: int = DEFAULT_HTTP_TIMEOUT) -> Dict[str, Any]:
     """发送 JSON POST 请求（无代理）
 
     Args:

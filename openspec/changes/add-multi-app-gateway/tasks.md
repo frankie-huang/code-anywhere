@@ -65,7 +65,7 @@
   - GATEWAY_URL = `local` → standalone 本地模式
   - GATEWAY_URL = 自定义地址 → 连指定网关
 - [ ] 7.3 Callback WS 客户端 register 消息自动携带 app_id（从 FEISHU_APP_ID 读取）
-- [ ] 7.4 迁移提示：standalone 用户升级后若未设 `FEISHU_GATEWAY_URL=local`，启动时给出明确提示
+- [ ] 7.4 迁移提示：standalone 用户升级后若未设 `GATEWAY_URL=local`，启动时给出明确提示
 
 ## 8. 配置与文档
 

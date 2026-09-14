@@ -3,6 +3,7 @@ Feishu Card Action - 卡片交互处理
 
 处理飞书卡片回传交互事件（card.action.trigger）：
 - _handle_card_action: 卡片交互总入口
+- _handle_permission_decision: 权限审批决策处理（allow/deny/always/interrupt）
 - _handle_new_session_form: 新会话表单提交处理
 - _handle_browse_directory: 浏览目录表单处理
 - _apply_custom_overrides: 表单自定义覆盖
@@ -22,12 +23,14 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
+from platforms.models import IMEvent
 from utils.concurrency import run_in_background
+from services.callback_client import forward_decision
 
 from .utils import (
-    TOAST_SUCCESS, TOAST_ERROR, TOAST_INFO,
+    TOAST_SUCCESS, TOAST_ERROR, TOAST_WARNING, TOAST_INFO,
     _sanitize_user_content,
-    _verify_operator_match, _get_binding_from_event,
+    _verify_operator_match, find_binding,
     _resolve_agent_command_from_binding,
 )
 from .message import (
@@ -35,9 +38,7 @@ from .message import (
     _build_creating_session_card,
 )
 from .forward import (
-    _forward_via_ws_or_http,
     _forward_new_request,
-    _forward_permission_request,
     _fetch_browse_dirs_from_callback,
 )
 from .card_session import (
@@ -64,7 +65,7 @@ _CARD_STATUS_CONFIG = {
 # 卡片交互处理
 # =============================================================================
 
-def _handle_card_action(data: dict) -> Tuple[bool, dict]:
+def _handle_card_action(event: IMEvent) -> Tuple[bool, dict]:
     """处理飞书卡片回传交互事件 card.action.trigger
 
     当用户点击卡片中的 callback 类型按钮或提交 form 表单时，飞书会发送此事件。
@@ -76,37 +77,30 @@ def _handle_card_action(data: dict) -> Tuple[bool, dict]:
     3. Form 表单提交：创建新会话时，选择工作目录 + 填写提示词的表单
 
     Args:
-        data: 飞书事件数据
+        event: 卡片回调事件（字段已由 IMAdapter.parse_event 解析）
 
     Returns:
         (handled, toast_response)
     """
     # 打印完整数据用于调试
-    logger.info(f"[feishu] _handle_card_action received data:\n{json.dumps(data, ensure_ascii=True, indent=2)}")
-
-    # 提取事件公共信息
-    header = data.get('header', {})
-    event = data.get('event', {})
-    action = event.get('action', {})
-    operator = event.get('operator', {})
+    logger.info(f"[feishu] _handle_card_action received data:\n{json.dumps(event.raw, ensure_ascii=True, indent=2)}")
 
     # 记录日志
-    event_id = header.get('event_id', '')
-    user_id = operator.get('open_id', operator.get('user_id', 'unknown'))
-    logger.info(f"[feishu] Card action: event_id={event_id}, user={user_id}")
+    user_id = event.operator_open_id or event.operator_user_id or 'unknown'
+    logger.info(f"[feishu] Card action: event_id={event.event_id}, user={user_id}")
 
-    # 提取数据：callback 按钮的数据在 value 中，form 表单的数据在 form_value 中
-    value = action.get('value', {})
-    form_value = action.get('form_value', {})
+    # callback 按钮的数据在 value 中，form 表单的数据在 form_value 中
+    value = event.action_value
+    form_value = event.form_value
 
     # ┌────────────────────────────────────────────────────────────────┐
     # │ 统一身份验证：如果卡片 value 中有 owner_id，必须与 operator 匹配    │
     # │ 适用于：Callback 按钮点击、Form 表单提交                          │
     # └────────────────────────────────────────────────────────────────┘
     owner_id = value.get('owner_id', '')
-    if owner_id and not _verify_operator_match(operator, owner_id):
+    if owner_id and not _verify_operator_match(event.operator_id_values, owner_id):
         logger.warning(
-            f"[feishu] Operator verification failed: owner_id={owner_id} not found in operator={operator}"
+            f"[feishu] Operator verification failed: owner_id={owner_id} not found in operator={event.operator_id_values}"
         )
         return True, {
             'toast': {
@@ -119,10 +113,10 @@ def _handle_card_action(data: dict) -> Tuple[bool, dict]:
     # │ 分支 1: 新会话表单提交（目录选择 + prompt 输入）                    │
     # │ 识别标志：按钮名称为 submit_btn 或 browse_*_btn                   │
     # └────────────────────────────────────────────────────────────────┘
-    trigger_name = action.get('name', '')
+    trigger_name = event.action_name
     new_session_form_buttons = ('submit_btn', 'browse_dir_select_btn', 'browse_custom_btn', 'browse_result_btn')
     if trigger_name in new_session_form_buttons:
-        return _handle_new_session_form(data, form_value)
+        return _handle_new_session_form(event, form_value)
 
     # ┌────────────────────────────────────────────────────────────────┐
     # │ 分支 2: Callback 按钮点击（权限决策、注册授权等）                   │
@@ -151,21 +145,15 @@ def _handle_card_action(data: dict) -> Tuple[bool, dict]:
             }
         }
 
-    # 提取卡片消息 ID（用于添加表情）
-    context = event.get('context', {})
-    card_message_id = context.get('open_message_id', '')
-
     # AskUserQuestion 表单提交（action=answer）
     if action_type == 'answer':
-        return _handle_ask_question_answer(request_id, form_value, data,
-                                           card_message_id=card_message_id)
+        return _handle_ask_question_answer(request_id, form_value, event)
 
-    # 调用 callback_url 的决策接口（callback_url 从 BindingStore 获取）
-    return _forward_permission_request(request_id, data, action_type,
-                                       card_message_id=card_message_id)
+    # 权限审批决策按钮（allow/deny/always/interrupt）
+    return _handle_permission_decision(request_id, event, action_type)
 
 
-def _handle_new_session_form(card_data: dict, form_values: dict) -> Tuple[bool, dict]:
+def _handle_new_session_form(event: IMEvent, form_values: dict) -> Tuple[bool, dict]:
     """处理新会话表单提交（异步模式）
 
     支持两种操作：
@@ -173,27 +161,24 @@ def _handle_new_session_form(card_data: dict, form_values: dict) -> Tuple[bool, 
     2. 点击"创建会话"按钮 → 立即返回"处理中"响应，后台异步执行会话创建
 
     Args:
-        card_data: 完整的飞书卡片事件数据
+        event: 卡片回调事件
         form_values: 表单提交的数据（包含 recent_dir, custom_dir, prompt, browse_result）
 
     Returns:
         (handled, response): handled 始终为 True，response 包含 toast 和卡片更新
     """
-    event = card_data.get('event', {})
-    action = event.get('action', {})
-
     # 获取触发按钮名称（飞书 Card 2.0 Form 提交时，按钮名称在 action.name）
-    trigger_name = action.get('name', '')
+    trigger_name = event.action_name
     logger.info(f"[feishu] Form trigger_name: {trigger_name}")
 
     # 从按钮的 value 中提取 chat_id、message_id 和 chat_type（用户原始消息 ID）
-    button_value = action.get('value', {})
+    button_value = event.action_value
     chat_id = button_value.get('chat_id', '')
     message_id = button_value.get('message_id', '')
     chat_type = button_value.get('chat_type', '')
 
-    # 提取提交者 user_id（注入子进程 env 后由 stop 卡片优先 at）
-    sender_id = event.get('operator', {}).get('user_id', '')
+    # 提交者 user_id（注入子进程 env 后由 stop 卡片优先 at；缺失时回退 open_id）
+    sender_id = event.operator_user_id
 
     # 从表单数据中提取字段
     recent_dir = form_values.get('recent_dir', '')  # 常用目录下拉选择的值
@@ -204,7 +189,7 @@ def _handle_new_session_form(card_data: dict, form_values: dict) -> Tuple[bool, 
     agent_command = form_values.get('agent_command', '') or form_values.get('claude_command', '')
 
     # 获取 binding（用于解析默认命令和后续请求）
-    binding = _get_binding_from_event(event)
+    binding = find_binding(event.operator_id_values, 'operator')
 
     # 解析 agent_type 和 command
     if '::' in agent_command:
@@ -240,7 +225,7 @@ def _handle_new_session_form(card_data: dict, form_values: dict) -> Tuple[bool, 
     # │ 分支 1: 点击"浏览"按钮（支持 browse_custom_btn 和 browse_result_btn）│
     # └────────────────────────────────────────────────────────────────┘
     if trigger_name in ('browse_dir_select_btn', 'browse_custom_btn', 'browse_result_btn'):
-        return _handle_browse_directory(trigger_name, recent_dir, custom_dir, chat_id, message_id, chat_type, event, form_values)
+        return _handle_browse_directory(trigger_name, recent_dir, custom_dir, chat_id, message_id, chat_type, binding, form_values)
 
     # ┌────────────────────────────────────────────────────────────────┐
     # │ 分支 2: 点击"创建会话"按钮（trigger_name = submit_btn）           │
@@ -286,7 +271,7 @@ def _handle_new_session_form(card_data: dict, form_values: dict) -> Tuple[bool, 
 
 def _handle_browse_directory(trigger_name: str, recent_dir: str, custom_dir: str,
                              chat_id: str, message_id: str, chat_type: str,
-                             feishu_event: dict, form_values: dict) -> Tuple[bool, dict]:
+                             binding: Optional[dict], form_values: dict) -> Tuple[bool, dict]:
     """处理浏览目录按钮点击
 
     调用 browse-dirs 接口获取子目录列表，返回更新后的卡片。
@@ -298,14 +283,12 @@ def _handle_browse_directory(trigger_name: str, recent_dir: str, custom_dir: str
         chat_id: 群聊 ID
         message_id: 原始消息 ID
         chat_type: 聊天类型（group/p2p），透传到重建的卡片
-        feishu_event: 飞书事件数据
+        binding: 提交者的绑定信息
         form_values: 表单数据（用于回填）
 
     Returns:
         (handled, response): handled 始终为 True，response 包含更新后的卡片
     """
-    # 获取绑定信息
-    binding = _get_binding_from_event(feishu_event)
     if not binding:
         logger.warning("[feishu] No binding found for browse")
         return True, {
@@ -380,7 +363,7 @@ def _handle_browse_directory(trigger_name: str, recent_dir: str, custom_dir: str
         chat_id=chat_id,
         message_id=message_id,
         chat_type=chat_type,
-        feishu_event=feishu_event
+        binding=binding
     )
 
     return True, {'card': {'type': 'raw', 'data': card}}
@@ -433,8 +416,146 @@ def _apply_custom_overrides(form_value: Dict[str, Any]) -> Tuple[Dict[str, Any],
     return cleaned, overridden
 
 
-def _handle_ask_question_answer(request_id: str, form_value: dict, original_data: dict,
-                                card_message_id: str = '') -> Tuple[bool, dict]:
+def _handle_permission_decision(request_id: str, event: IMEvent,
+                                action_type: str) -> Tuple[bool, dict]:
+    """处理权限审批卡片的决策按钮（allow/deny/always/interrupt）
+
+    决策经 forward_decision 转发到 Callback 的纯决策接口，根据返回的
+    三元组生成 toast 与更新后的卡片。飞书要求 3 秒内返回响应，
+    转发超时 2 秒预留处理时间。
+
+    Args:
+        request_id: 请求 ID
+        event: 卡片回调事件（project_dir 从 action_value 提取）
+        action_type: 动作类型 (allow/always/deny/interrupt)
+
+    Returns:
+        (handled, toast_response)
+    """
+    import socket
+    import urllib.error
+
+    # 获取绑定信息
+    binding = find_binding(event.operator_id_values, 'operator')
+    if not binding:
+        logger.warning("[feishu] No binding found for permission request")
+        return True, {
+            'toast': {
+                'type': TOAST_ERROR,
+                'content': '身份验证失败，请重新注册网关'
+            }
+        }
+
+    owner_id = binding.get('_owner_id', '')
+
+    # 构建请求数据
+    request_data = {
+        'action': action_type,
+        'request_id': request_id
+    }
+
+    # 添加可选字段
+    if 'project_dir' in event.action_value:
+        request_data['project_dir'] = event.action_value['project_dir']
+
+    logger.info("[feishu] Forwarding permission request: owner_id=%s, action=%s", owner_id, action_type)
+
+    start_time = time.time()
+
+    try:
+        # 传输与三元组解析经 forward_decision 收口（2s 超时为卡片 3s 响应
+        # 要求预留余量），本函数只保留决策的呈现
+        result = forward_decision(binding, request_data)
+
+        if result is None:
+            logger.warning("[feishu] Forward failed: no available route")
+            return True, {
+                'toast': {
+                    'type': TOAST_ERROR,
+                    'content': '回调服务不可达，请检查服务状态'
+                }
+            }
+
+        elapsed = (time.time() - start_time) * 1000
+
+        success, decision, message = result
+
+        # 根据决策结果生成 toast
+        response_body = {}
+        if success and decision:
+            if decision == 'allow':
+                toast_type = TOAST_SUCCESS
+            else:  # deny
+                toast_type = TOAST_WARNING
+            toast_content = message or ('已批准运行' if decision == 'allow' else '已拒绝运行')
+            logger.info(f"[feishu] Decision succeeded: decision={decision}, message={message}, elapsed={elapsed:.0f}ms")
+            # 决策成功后，异步添加 Typing 表情（拒绝并中断时不需要，因为预期任务会停止）
+            if action_type != 'interrupt':
+                run_in_background(_add_typing_reaction, (event.card_message_id,))
+
+            # 尝试在回调响应中返回更新后的卡片（移除按钮，更新状态）
+            updated_card = _get_updated_card_for_response(request_id, action_type)
+            if updated_card:
+                response_body['card'] = {
+                    'type': 'raw',
+                    'data': updated_card
+                }
+                logger.debug(f"[feishu] Returning updated card in response for request: {request_id}")
+        else:
+            toast_type = TOAST_ERROR
+            toast_content = message or '处理失败'
+            logger.warning(f"[feishu] Decision failed: message={toast_content}, elapsed={elapsed:.0f}ms")
+
+        response_body['toast'] = {
+            'type': toast_type,
+            'content': toast_content
+        }
+        return True, response_body
+
+    except urllib.error.HTTPError as e:
+        logger.error(f"[feishu] Forward HTTP error: {e.code} {e.reason}")
+        # 401 表示 auth_token 验证失败
+        if e.code == 401:
+            return True, {
+                'toast': {
+                    'type': TOAST_ERROR,
+                    'content': '身份验证失败，请重新注册网关'
+                }
+            }
+        return True, {
+            'toast': {
+                'type': TOAST_ERROR,
+                'content': f'回调服务错误: HTTP {e.code}'
+            }
+        }
+    except urllib.error.URLError as e:
+        logger.error(f"[feishu] Forward URL error: {e.reason}")
+        return True, {
+            'toast': {
+                'type': TOAST_ERROR,
+                'content': '回调服务不可达，请检查服务状态'
+            }
+        }
+    except socket.timeout:
+        logger.error("[feishu] Forward timeout")
+        return True, {
+            'toast': {
+                'type': TOAST_ERROR,
+                'content': '回调服务响应超时'
+            }
+        }
+    except Exception as e:
+        logger.error(f"[feishu] Forward error: {e}")
+        return True, {
+            'toast': {
+                'type': TOAST_ERROR,
+                'content': f'转发失败: {str(e)}'
+            }
+        }
+
+
+def _handle_ask_question_answer(request_id: str, form_value: dict,
+                                event: IMEvent) -> Tuple[bool, dict]:
     """处理 AskUserQuestion 表单提交
 
     从 form_value 中提取用户的选择/输入，构造 answers dict，
@@ -443,8 +564,7 @@ def _handle_ask_question_answer(request_id: str, form_value: dict, original_data
     Args:
         request_id: 请求 ID
         form_value: 表单提交数据，包含 q_0_select, q_0_custom 等字段
-        original_data: 原始飞书事件数据
-        card_message_id: 卡片消息 ID（用于添加表情）
+        event: 卡片回调事件（card_message_id 用于添加表情）
 
     Returns:
         (handled, toast_response)
@@ -453,8 +573,7 @@ def _handle_ask_question_answer(request_id: str, form_value: dict, original_data
     logger.debug("[feishu] form_value: %s", json.dumps(form_value, ensure_ascii=False, indent=2))
 
     # 获取绑定信息
-    event = original_data.get('event', {})
-    binding = _get_binding_from_event(event)
+    binding = find_binding(event.operator_id_values, 'operator')
     if not binding:
         logger.warning("[feishu] No binding found for AskUserQuestion request")
         return True, {
@@ -478,10 +597,10 @@ def _handle_ask_question_answer(request_id: str, form_value: dict, original_data
     start_time = time.time()
 
     try:
-        # 使用 WS/HTTP 路由分发
-        response_data = _forward_via_ws_or_http(binding, '/cb/decision', request_data, timeout=2)
+        # 传输与三元组解析经 forward_decision 收口，本函数只保留问卷的呈现
+        result = forward_decision(binding, request_data)
 
-        if response_data is None:
+        if result is None:
             logger.warning("[feishu] AskUserQuestion forward failed: no available route")
             return True, {
                 'toast': {
@@ -492,9 +611,7 @@ def _handle_ask_question_answer(request_id: str, form_value: dict, original_data
 
         elapsed = (time.time() - start_time) * 1000
 
-        success = response_data.get('success', False)
-        decision = response_data.get('decision')
-        message = response_data.get('message', '')
+        success, decision, message = result
 
         response_body = {}
         if success and decision:
@@ -506,7 +623,7 @@ def _handle_ask_question_answer(request_id: str, form_value: dict, original_data
                 toast_content += f'（{nums}的自定义内容已覆盖选项）'
             logger.info("[feishu] AskUserQuestion succeeded: decision=%s, elapsed=%.0fms", decision, elapsed)
             # 决策成功后，异步添加 Typing 表情
-            run_in_background(_add_typing_reaction, (card_message_id,))
+            run_in_background(_add_typing_reaction, (event.card_message_id,))
 
             # 尝试在回调响应中返回更新后的卡片
             updated_card = _get_updated_card_for_response(request_id, 'answer', form_value=form_value)

@@ -18,7 +18,7 @@ POST 路由:
 - /cb/session/get-chat-id: 根据 session_id 获取 chat_id
 - /cb/session/get-last-message-id: 获取 session 的最近消息 ID
 - /cb/session/set-last-message-id: 设置 session 的最近消息 ID
-- /cb/session/set-env: 记录 session 启动时的白名单 env 快照（hook 调用，续聊注入）
+- /cb/session/set-meta: 记录 session 元数据（env 快照 + transcript 路径，hook 调用，合并语义）
 - /cb/session/check-skip-user-prompt: 检查并清除跳过用户 prompt 标志
 - /cb/session/ensure-chat: 确保 session 有 chat_id（group 模式懒创建群聊）
 - /cb/session/get-info: 按 session_id 返回 session 权威字段（command 等）
@@ -29,6 +29,7 @@ POST 路由:
 - /cb/agent/new: 新建会话
 - /cb/agent/continue: 继续会话
 - /cb/agent/stop: 停止会话中正在执行的 Agent 进程
+- /cb/agent/copy: 提取会话最后答复并以 markdown 代码块回发
 - /cb/directory/record-usage: 记录目录使用
 - /cb/directory/recent-dirs: 获取近期工作目录
 - /cb/directory/browse-dirs: 浏览子目录
@@ -49,8 +50,9 @@ from services.decision_handler import handle_decision
 from config import VSCODE_URI_PREFIX, PERMISSION_REQUEST_TIMEOUT
 from handlers.register import handle_register_callback, handle_check_owner_id
 from handlers.agent import handle_continue_session, handle_new_session, handle_stop_session
+from handlers.transcript import handle_copy_response
 from handlers.responses import send_json, send_html_response
-from handlers.outbound import create_feishu_group
+from handlers.outbound import create_group
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +209,14 @@ def handle_agent_stop(data: Dict[str, Any], headers: Dict[str, str]) -> Tuple[in
     return status, response
 
 
+def handle_agent_copy(data: Dict[str, Any], headers: Dict[str, str]) -> Tuple[int, Dict[str, Any]]:
+    """提取会话最后答复并以 markdown 代码块回发（飞书网关调用）"""
+    if not check_global_auth_token(headers, '/cb/agent/copy'):
+        return 401, {'error': 'Unauthorized'}
+
+    return handle_copy_response(data)
+
+
 def handle_get_chat_id(data: Dict[str, Any], headers: Dict[str, str]) -> Tuple[int, Dict[str, Any]]:
     """根据 session_id 获取对应的 chat_id（客户端调用）
 
@@ -298,32 +308,50 @@ def handle_set_last_message_id(data: Dict[str, Any], headers: Dict[str, str]) ->
         return 500, {'success': False, 'error': 'SessionChatStore not initialized'}
 
 
-def handle_set_env_overrides(data: Dict[str, Any], headers: Dict[str, str]) -> Tuple[int, Dict[str, Any]]:
-    """记录 session 启动时的白名单 env 快照（hook 调用）
+def handle_set_session_meta(data: Dict[str, Any], headers: Dict[str, str]) -> Tuple[int, Dict[str, Any]]:
+    """记录 session 元数据（hook 调用，合并语义）
 
-    hook 进程继承了启动 agent 的 shell 实际 env，白名单过滤后上报。
-    续聊时 AgentAdapter 取出作为 K=V 前缀注入，覆盖用户 shell 全局 env。
+    hook 进程（report_session_meta）上报的会话元数据，按「字段是否存在」
+    判断更新（缺失 = 不动，出现 = 更新，显式空串 = 清空）：
+    - env: 启动 agent 的 shell 白名单 env 快照（续聊时 AgentAdapter 取出
+      作为 K=V 前缀注入，覆盖用户 shell 全局 env）
+    - transcript_path: 会话 transcript 文件路径（事后提取会话答复用），
+      传空串清除记录中的路径
+
+    旧路由名 /cb/session/set-env 直接移除不保留别名：调用方只有 Shell
+    hook（report_session_meta），随 ./setup.sh update 与后端同步升级；
+    开发期直接 git pull/切分支不重启会有短暂 404，上报 best-effort、
+    下一 hook 事件自愈，可接受。
     """
     from stores.session_chat_store import SessionChatStore
 
-    if not check_global_auth_token(headers, '/cb/session/set-env'):
+    if not check_global_auth_token(headers, '/cb/session/set-meta'):
         return 401, {'error': 'Unauthorized'}
 
     session_id = data.get('session_id', '')
-    env = data.get('env', {})
+    has_env = 'env' in data
+    env = data.get('env')
+    has_path = 'transcript_path' in data
+    transcript_path = data.get('transcript_path', '')
 
     if not session_id:
         return 400, {'success': False, 'error': 'Missing session_id'}
-    if not isinstance(env, dict):
+    if has_env and not isinstance(env, dict):
         return 400, {'success': False, 'error': 'env must be an object'}
+    if has_path and not isinstance(transcript_path, str):
+        return 400, {'success': False, 'error': 'transcript_path must be a string'}
 
     store = SessionChatStore.get_instance()
     if not store:
         return 500, {'success': False, 'error': 'SessionChatStore not initialized'}
 
-    if store.set_env_overrides(session_id, env):
-        return 200, {'success': True}
-    return 500, {'success': False, 'error': 'Failed to save env_overrides'}
+    if has_env:
+        if not store.set_env_overrides(session_id, env):
+            return 500, {'success': False, 'error': 'Failed to save env_overrides'}
+    if has_path:
+        if not store.set_transcript_path(session_id, transcript_path):
+            return 500, {'success': False, 'error': 'Failed to save transcript_path'}
+    return 200, {'success': True}
 
 
 def handle_record_dir_usage(data: Dict[str, Any], headers: Dict[str, str]) -> Tuple[int, Dict[str, Any]]:
@@ -639,7 +667,7 @@ def do_ensure_chat(agent_type: str, session_id: str, project_dir: str) -> Tuple[
     """确保 session 存在且有对应的 chat_id（group 模式下创建群聊）
 
     调用方（各自负责鉴权）:
-    - handle_ensure_chat (HTTP /cb/session/ensure-chat): Shell 脚本启动时调用，返回空则 fallback 到 FEISHU_CHAT_ID
+    - handle_ensure_chat (HTTP /cb/session/ensure-chat): Shell 脚本启动时调用，返回空则 fallback 到平台 chat id 环境变量（feishu 为 FEISHU_CHAT_ID）
     - handle_new_session (agent.py): P2P /new（group 模式无 chat_id）时调用，失败则整个 /new 失败
 
     行为按 session_mode 分支：
@@ -700,7 +728,7 @@ def do_ensure_chat(agent_type: str, session_id: str, project_dir: str) -> Tuple[
 
         # 创建群聊（网关侧原子完成：建群 + 归属 + seq 分配 + 写 GroupSessionStore 路由）
         # seq 在 group_store.allocate 内部自带 INFO 日志，此处不重复
-        ok, result = create_feishu_group(session_id, project_dir)
+        ok, result = create_group(session_id, project_dir)
         if not ok:
             logger.error("[ensure-chat] Failed to create group: %s", result)
             return False, result
@@ -1150,7 +1178,7 @@ BACKEND_ROUTES: Dict[str, PostRouteHandler] = {
     '/cb/session/get-chat-id': handle_get_chat_id,
     '/cb/session/get-last-message-id': handle_get_last_message_id,
     '/cb/session/set-last-message-id': handle_set_last_message_id,
-    '/cb/session/set-env': handle_set_env_overrides,
+    '/cb/session/set-meta': handle_set_session_meta,
     '/cb/session/check-skip-user-prompt': handle_check_skip_user_prompt,
     '/cb/session/ensure-chat': handle_ensure_chat,
     '/cb/session/get-info': handle_get_session_info,
@@ -1161,6 +1189,7 @@ BACKEND_ROUTES: Dict[str, PostRouteHandler] = {
     '/cb/agent/new': handle_agent_new,
     '/cb/agent/continue': handle_agent_continue,
     '/cb/agent/stop': handle_agent_stop,
+    '/cb/agent/copy': handle_agent_copy,
     '/cb/directory/record-usage': handle_record_dir_usage,
     '/cb/directory/recent-dirs': handle_recent_dirs,
     '/cb/directory/browse-dirs': handle_browse_dirs,

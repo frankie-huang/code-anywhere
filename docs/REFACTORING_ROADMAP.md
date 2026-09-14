@@ -2,7 +2,11 @@
 
 > 分阶段重构计划，每个 Issue 独立可交付，互不阻塞（除标注依赖外）。
 >
-> 创建: 2026-04-03 ｜ 最后更新: 2026-06-20
+> 创建: 2026-04-03 ｜ 最后更新: 2026-08-29
+>
+> 范围说明：IM 平台适配层重构（`platforms/` + Shell `lib/im.sh`，Shell/Python
+> 两阶段）不在本 roadmap 的 Issue 体系内，完成记录见 CHANGELOG
+> （2026-08-09 Shell 层 / 2026-08-29 Python 层）。
 
 ## 进度总览
 
@@ -19,7 +23,7 @@
 | 9 | 核心路径单元测试 | ⬜ 待办 |
 | 10 | 端到端集成测试 | ⬜ 待办 |
 | 11 | `outbound.py` 迁移到 services 层 | ⬜ 待办 |
-| 12 | 拆分 `handlers/register.py`（HTTP/WS/授权卡片） | ⬜ 待办 |
+| 12 | 拆分 `handlers/register.py`（HTTP/WS/授权卡片） | ✅ 已完成（2026-08-29） |
 | 13 | 拆分 `handlers/callback.py`（决策/会话/目录/配置） | ⬜ 待办 |
 
 ---
@@ -99,25 +103,27 @@ services/
 
 ---
 
-### Issue 12: 拆分 `handlers/register.py`
+### Issue 12: 拆分 `handlers/register.py` ✅ 已完成
 
 **现状**: 1279 行，21 个函数。同一文件混合了三类职责：网关侧 HTTP 注册（`handle_register_request` / `_process_registration` / 授权卡片构建与下发 / 管理员通知）、WS 隧道授权流程（`handle_ws_*` 约 8 个函数）、归属验证与解绑（`_check_owner_id` / `handle_register_unbind`）。
 
-**目标结构**（按注册通道拆分）:
+**实际结构**（未按注册通道拆，按"平台无关编排 vs 平台形态"拆）:
 
 ```
-handlers/register/
-├── __init__.py        → 对外门面，保留现有 import 路径
-├── http_register.py   → HTTP 注册请求 + 回调 + 归属验证
-├── ws_register.py     → WS 隧道注册/授权/解绑
-└── auth_card.py       → 授权卡片构建与下发（含管理员通知）
+handlers/register.py              → 363 行，平台无关注册编排
+                                    （HTTP 注册请求、后台注册编排、回调通知、owner 归属验证）
+handlers/feishu/authorization.py  → 895 行，授权的飞书形态
+                                    （授权卡片构建/发送、HTTP/WS 授权结果、管理员通知）
 ```
 
-**验收标准**:
+**验收结果**:
 
-- [ ] 每个文件 ≤ 500 代码行
-- [ ] 外部 import 路径不变（`from handlers.register import ...`）
-- [ ] 网关鉴权逻辑（owner_id 比对）集中、可单测
+- [x] `register.py` 降至 363 行（远低于 500 阈值）
+- [x] 外部 import 路径不变（`from handlers.register import ...`）
+- [x] owner 归属验证集中在 register（`_check_owner_id` / `handle_check_owner_id`）；换绑/解绑在 authorization（经 adapter 调用），卡片操作者校验由 `card_action` 入口统一前置
+
+> 说明：拆分维度从原计划的"按注册通道（HTTP/WS）"调整为"按平台无关编排 vs 平台形态"——IM 平台适配层重构（`platforms/`）落地后，register 只剩平台无关逻辑，飞书形态归入 `handlers/feishu/`。`authorization.py` 895 行仍超标，已列入 ARCHITECTURE 2.3 技术债表（P2 待评估）；
+解绑/换绑（`handle_register_unbind` / `handle_ws_*`）随飞书形态一并归入该模块。
 
 ---
 

@@ -3,12 +3,12 @@
 Callback 后端使用，启动时自动向飞书网关注册获取 auth_token。
 
 OpenAPI 模式下：
-  - 分离部署（配置 FEISHU_GATEWAY_URL=http(s)://）：HTTP 回调模式，向远端网关注册
-  - 分离部署（配置 FEISHU_GATEWAY_URL=ws(s)://）：WS 隧道模式，无需 HTTP 注册
-  - 单机部署（未配置 FEISHU_GATEWAY_URL）：使用 WS 隧道连接本地网关
+  - 分离部署（配置 GATEWAY_URL=http(s)://）：HTTP 回调模式，向远端网关注册
+  - 分离部署（配置 GATEWAY_URL=ws(s)://）：WS 隧道模式，无需 HTTP 注册
+  - 单机部署（未配置 GATEWAY_URL）：使用 WS 隧道连接本地网关
 
-需配置：CALLBACK_SERVER_URL、FEISHU_OWNER_ID
-注册接口：{FEISHU_GATEWAY_URL}/gw/register
+需配置：CALLBACK_SERVER_URL 与平台 owner 配置（feishu 为 FEISHU_OWNER_ID）
+注册接口：{GATEWAY_URL}/gw/register
 """
 
 import json
@@ -16,12 +16,33 @@ import logging
 import threading
 import urllib.request
 import urllib.error
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, Tuple, Dict, Any
+
+from utils.http_client import DEFAULT_HTTP_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
-# HTTP 请求超时（秒）
-HTTP_TIMEOUT = 10
+
+def build_binding_params() -> Dict[str, Any]:
+    """组装注册时的 per-user 配置默认值（WS 隧道与 HTTP 注册共用）
+
+    平台自有默认值经 adapter 提供（default_binding_params）；Agent 命令
+    表与默认聊天目录是平台无关项，在此合并。
+    """
+    from config import DEFAULT_CHAT_DIR, DEFAULT_CHAT_FOLLOW_THREAD, get_default_agent
+    from agents import get_all_agent_commands
+    from platforms import get_im_adapter
+
+    all_cmds = get_all_agent_commands()
+    binding_params = get_im_adapter().default_binding_params()
+    binding_params.update({
+        'default_agent': get_default_agent(),
+        'claude_commands': all_cmds.get('claude'),
+        'codex_commands': all_cmds.get('codex'),
+        'default_chat_dir': DEFAULT_CHAT_DIR,
+        'default_chat_follow_thread': DEFAULT_CHAT_FOLLOW_THREAD,
+    })
+    return binding_params
 
 
 class AutoRegister:
@@ -98,36 +119,13 @@ class AutoRegister:
 
     def _register(self):
         """执行注册"""
-        from config import (
-            FEISHU_REPLY_IN_THREAD,
-            FEISHU_SESSION_MODE, DEFAULT_CHAT_DIR,
-            DEFAULT_CHAT_FOLLOW_THREAD, FEISHU_GROUP_NAME_PREFIX,
-            FEISHU_GROUP_DISSOLVE_DAYS, FEISHU_GROUP_PREFIX_CHAT_ID,
-            FEISHU_GROUP_ALLOW_COWORK
-        )
-        from agents import get_all_agent_commands
-        from config import get_default_agent
-
         logger.info(
             f"[auto-register] Starting registration in background: "
             f"owner_id={self._owner_id}, callback_url={self._callback_url}, gateway={self._gateway_url}"
         )
 
-        all_cmds = get_all_agent_commands()
         register_url = self._gateway_url.rstrip('/') + '/gw/register'
-        binding_params = {
-            'reply_in_thread': FEISHU_REPLY_IN_THREAD,
-            'session_mode': FEISHU_SESSION_MODE,
-            'default_agent': get_default_agent(),
-            'claude_commands': all_cmds.get('claude'),
-            'codex_commands': all_cmds.get('codex'),
-            'default_chat_dir': DEFAULT_CHAT_DIR,
-            'default_chat_follow_thread': DEFAULT_CHAT_FOLLOW_THREAD,
-            'group_name_prefix': FEISHU_GROUP_NAME_PREFIX,
-            'group_dissolve_days': FEISHU_GROUP_DISSOLVE_DAYS,
-            'group_prefix_chat_id': FEISHU_GROUP_PREFIX_CHAT_ID,
-            'group_allow_cowork': FEISHU_GROUP_ALLOW_COWORK,
-        }
+        binding_params = build_binding_params()
         success, message = self._do_register(
             self._callback_url, self._owner_id, register_url,
             binding_params=binding_params
@@ -179,10 +177,10 @@ class AutoRegister:
             # 创建无代理的 opener
             no_proxy_handler = urllib.request.ProxyHandler({})
             opener = urllib.request.build_opener(no_proxy_handler)
-            with opener.open(req, timeout=HTTP_TIMEOUT) as response:
+            with opener.open(req, timeout=DEFAULT_HTTP_TIMEOUT) as response:
                 response_data = json.loads(response.read().decode('utf-8'))
                 if response_data.get('success'):
-                    logger.info(f"[auto-register] Registration accepted")
+                    logger.info("[auto-register] Registration accepted")
                     return True, response_data.get('message', 'Accepted')
                 else:
                     error = response_data.get('error', 'Unknown error')

@@ -272,7 +272,7 @@ CALLBACK_SERVER_PORT=8080
 ```bash
 # Callback 实例 .env（本地开发）
 FEISHU_SEND_MODE=openapi
-FEISHU_GATEWAY_URL=ws://gateway-server:8080  # ws:// 启用 WS 隧道
+GATEWAY_URL=ws://gateway-server:8080  # ws:// 启用 WS 隧道
 CALLBACK_SERVER_URL=http://localhost:8081    # 本地开发无需公网可达
 CALLBACK_SERVER_PORT=8081
 FEISHU_OWNER_ID=ou_user_a  # 此实例的消息接收者（user_id 格式）
@@ -283,13 +283,13 @@ FEISHU_OWNER_ID=ou_user_a  # 此实例的消息接收者（user_id 格式）
 ```bash
 # Callback 实例 .env（云服务器）
 FEISHU_SEND_MODE=openapi
-FEISHU_GATEWAY_URL=http://gateway-server:8080  # http:// HTTP 回调
+GATEWAY_URL=http://gateway-server:8080  # http:// HTTP 回调
 CALLBACK_SERVER_URL=http://instance-a:8081     # 需要公网可达
 CALLBACK_SERVER_PORT=8081
 FEISHU_OWNER_ID=ou_user_a  # 此实例的消息接收者（user_id 格式）
 ```
 
-> **协议头说明**：`FEISHU_GATEWAY_URL` 的协议头决定连接模式
+> **协议头说明**：`GATEWAY_URL` 的协议头决定连接模式
 > - `ws://` 或 `wss://` → WS 隧道模式（Callback 无需公网可达，本地开发推荐）
 > - `http://` 或 `https://` → HTTP 回调模式（Callback 需公网可达）
 
@@ -306,7 +306,7 @@ FEISHU_OWNER_ID=ou_user_a  # 此实例的消息接收者（user_id 格式）
 | `FEISHU_EVENT_MODE` | 否 | `auto` | 事件接收模式：`auto`/`http`/`longpoll`（一般无需配置，auto 自动选择） |
 | `FEISHU_OWNER_ID` | **是** | - | 默认消息接收者（OpenAPI 模式必需） |
 | `FEISHU_CHAT_ID` | 否 | - | 默认群聊 ID |
-| `FEISHU_GATEWAY_URL` | **Callback** | `CALLBACK_SERVER_URL` | 网关地址（分离部署时配置）。协议头决定连接模式：`ws://` 启用 WS 隧道（推荐），`http://` 使用 HTTP 回调。不配置则默认使用 `CALLBACK_SERVER_URL` |
+| `GATEWAY_URL` | **Callback** | `CALLBACK_SERVER_URL` | 网关地址（分离部署时配置）。协议头决定连接模式：`ws://` 启用 WS 隧道（推荐），`http://` 使用 HTTP 回调。不配置则默认使用 `CALLBACK_SERVER_URL` |
 | `CALLBACK_SERVER_URL` | **是** | `http://localhost:8080` | 回调服务外部访问地址（WS 隧道模式下可使用 localhost） |
 | `CALLBACK_SERVER_PORT` | 否 | `8080` | 回调服务监听端口 |
 | `FEISHU_REPLY_IN_THREAD` | 否 | `false` | 话题内回复模式：回复消息收进话题详情，不刷群聊主界面 |
@@ -509,7 +509,7 @@ git clone ... && cd code-anywhere
 # 配置
 cat > .env << EOF
 FEISHU_SEND_MODE=openapi
-FEISHU_GATEWAY_URL=ws://gateway-server:8080  # ws:// 启用 WS 隧道
+GATEWAY_URL=ws://gateway-server:8080  # ws:// 启用 WS 隧道
 FEISHU_OWNER_ID=ou_user_a                    # user_id 格式
 CALLBACK_SERVER_URL=http://localhost:8081    # 本地无需公网可达
 CALLBACK_SERVER_PORT=8081
@@ -529,7 +529,7 @@ git clone ... && cd code-anywhere
 # 配置
 cat > .env << EOF
 FEISHU_SEND_MODE=openapi
-FEISHU_GATEWAY_URL=http://gateway-server:8080
+GATEWAY_URL=http://gateway-server:8080
 FEISHU_OWNER_ID=ou_user_a                    # user_id 格式
 CALLBACK_SERVER_URL=http://this-machine:8081  # 需要公网可达
 CALLBACK_SERVER_PORT=8081
@@ -604,7 +604,7 @@ Callback                        Gateway                         飞书用户
 |------|:----:|------|
 | `CALLBACK_SERVER_URL` | **是** | Callback 服务外部访问地址（WS 模式可使用 localhost） |
 | `FEISHU_OWNER_ID` | **是** | 默认消息接收者 |
-| `FEISHU_GATEWAY_URL` | **是** | 飞书网关地址（协议头决定连接模式） |
+| `GATEWAY_URL` | **是** | 飞书网关地址（协议头决定连接模式） |
 
 > **注意**：Callback 服务不需要 `FEISHU_VERIFICATION_TOKEN`，网关通过注册时生成的 `auth_token` 验证请求。
 
@@ -715,7 +715,7 @@ FEISHU_OWNER_ID=ou_xxx  # user_id 格式
 FEISHU_VERIFICATION_TOKEN=your_verification_token
 
 # 分离部署 - Callback（不需要 VERIFICATION_TOKEN）
-FEISHU_GATEWAY_URL=http://gateway-server:8080
+GATEWAY_URL=http://gateway-server:8080
 ```
 
 ### 安全检查清单
@@ -761,13 +761,13 @@ HTTP 回调模式下检查以下几点：
 **A:** 根据连接模式检查：
 
 **WS 隧道模式**：
-1. `FEISHU_GATEWAY_URL` 是否使用 `ws://` 协议头
+1. `GATEWAY_URL` 是否使用 `ws://` 协议头
 2. 网关服务是否正常运行
 3. 网络是否可以连接到网关（WS 隧道无需公网 IP，但需能访问网关）
 4. 检查网关日志中是否有 WS 连接记录
 
 **HTTP 回调模式**：
-1. `FEISHU_GATEWAY_URL` 是否使用 `http://` 协议头
+1. `GATEWAY_URL` 是否使用 `http://` 协议头
 2. `CALLBACK_SERVER_URL` 是否可以从网关访问（需要公网可达）
 3. 网关服务是否正常运行
 4. 检查网关日志中是否有注册请求记录

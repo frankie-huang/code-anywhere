@@ -2,7 +2,7 @@
 
 > 本文档是项目的架构权威参考。所有新增代码、重构和 Code Review 必须遵循此处定义的约束。
 >
-> 最后更新: 2026-06-20
+> 最后更新: 2026-08-29
 
 ---
 
@@ -44,6 +44,7 @@ Claude-Anywhere 是 Claude Code 的飞书集成扩展，通过 Hook 机制拦截
         │  └──►                 ├──────► Python Backend        │
         │     │  ack JSON       │      │  ├─ handlers/        │
         │     │  decision JSON  │◄─────┤  ├─ services/        │
+        │                              │  ├─ platforms/       │
         │     └─────────────────┘      │  ├─ stores/          │
         │                              │  ├─ utils/           │
         │                              │  ├─ models/          │
@@ -95,15 +96,17 @@ Claude-Anywhere 是 Claude Code 的飞书集成扩展，通过 Hook 机制拦截
 ```
 if FEISHU_SEND_MODE == 'webhook':
     → WEBHOOK
-elif 无 FEISHU_GATEWAY_URL 且有 APP_ID:
+elif 无 GATEWAY_URL 且有 APP_ID:
     → OPENAPI_STANDALONE
-elif 有 FEISHU_GATEWAY_URL 且协议为 ws/wss:
+elif 有 GATEWAY_URL 且协议为 ws/wss:
     → OPENAPI_CALLBACK_WS
-elif 有 FEISHU_GATEWAY_URL 且有 CALLBACK_SERVER_URL:
+elif 有 GATEWAY_URL 且有 CALLBACK_SERVER_URL:
     → OPENAPI_CALLBACK_HTTP
-elif 无 FEISHU_OWNER_ID:
+elif 无 owner_id（adapter.get_owner_id()）:
     → PURE_GATEWAY
 ```
+
+> GATEWAY_URL 为平台无关键名（旧键 FEISHU_GATEWAY_URL 继续生效，两者都配时新键优先）。
 
 ---
 
@@ -120,11 +123,14 @@ src/
 │   └── user_prompt.sh          #   用户输入 → 飞书转发
 ├── lib/                        # Shell 基础库（纯函数/工具）
 │   ├── core.sh                 #   路径、环境、日志、get_config
-│   ├── feishu.sh               #   ⚠️ 卡片构建 + API 调用（2371 行，待拆分）
+│   ├── callback.sh             #   平台无关的 Callback 后端客户端（HTTP/凭证/网关地址）
+│   ├── feishu.sh               #   ⚠️ 飞书平台实现：卡片构建 + API 调用（2180 行，待拆分）
+│   ├── im.sh                   #   IM 平台路由层（按 IM_PLATFORM 加载平台实现）
 │   ├── json.sh                 #   JSON 解析（jq/python3/grep 降级）
 │   ├── socket.sh               #   Socket IPC 客户端
 │   ├── tool.sh                 #   工具信息格式化
 │   ├── tool-config.sh          #   tools.json 配置加载
+│   ├── transcript.sh           #   transcript 答复提取（支持 CLI 直调）
 │   └── vscode-proxy.sh         #   VSCode SSH 代理
 ├── server/                     # Python 后端
 │   ├── main.py                 #   服务编排与启动
@@ -134,9 +140,11 @@ src/
 │   │   ├── http_handler.py     #     HTTP 路由分发
 │   │   ├── callback.py         #     权限决策回调 (/allow, /deny, ...)
 │   │   ├── agent.py            #     会话操作 (/cb/session/new, /continue)
-│   │   ├── feishu/             #     飞书事件处理（已拆分为包，10 文件）
+│   │   ├── feishu/             #     飞书事件处理（已拆分为包，12 文件）
 │   │   │   ├── __init__.py     #       事件路由门面 + _COMMANDS + re-export
+│   │   │   ├── authorization.py #      注册/换绑/解绑授权（卡片构建与结果处理）
 │   │   │   ├── utils.py        #       工具（binding/脱敏/agent 命令）
+│   │   │   ├── content.py      #       入站消息内容与 @提及 解析
 │   │   │   ├── forward.py      #       WS/HTTP 隧道转发
 │   │   │   ├── message.py      #       消息发送 + 杂项卡片
 │   │   │   ├── card_session.py #       新会话表单卡片
@@ -145,20 +153,28 @@ src/
 │   │   │   ├── group.py        #       群聊 CRUD + HTTP 端点
 │   │   │   ├── mute.py         #       /mute /unmute
 │   │   │   └── notify.py       #       /notify
-│   │   ├── register.py         #     网关注册
+│   │   ├── register.py         #     网关注册（平台无关编排）
 │   │   ├── ws_handler.py       #     WebSocket 隧道入口
 │   │   ├── permission_mcp.py   #     MCP 权限桥接
-│   │   ├── outbound.py         #     飞书出站门面（reply/建群/移除 typing）
+│   │   ├── outbound.py         #     IM 出站门面（平台无关，转发 adapter.cb_*）
 │   │   └── responses.py        #     HTTP 响应写回（send_json/send_html）
+│   ├── platforms/              #   IM 平台适配层（平台抽象框架）
+│   │   ├── base.py             #     IMAdapter 接口（四档强制力）+ GroupCapable 混入
+│   │   ├── models.py           #     入站事件中立模型 IMEvent（框架自带契约类型）
+│   │   ├── feishu_adapter.py   #     飞书实现（生命周期/出站/授权/事件解析/群聊）
+│   │   └── __init__.py         #     工厂（get_im_adapter，按 IM_PLATFORM 实例化）
 │   ├── services/               #   业务逻辑层
 │   │   ├── request_manager.py  #     权限请求生命周期管理
 │   │   ├── decision_handler.py #     决策处理逻辑
 │   │   ├── session_facade.py   #     会话操作网关
 │   │   ├── codex_rule_writer.py #    Codex execpolicy 规则持久化
 │   │   ├── feishu_api.py       #     飞书 OpenAPI 客户端
-│   │   ├── feishu_longpoll.py  #     飞书 WebSocket 事件接收
+│   │   ├── feishu_longpoll.py  #     飞书 WebSocket 事件接收（纯 SDK 封装，事件入口由适配层注入）
 │   │   ├── auto_register.py    #     网关自动注册
 │   │   ├── auth_token.py       #     Token 生成/验证
+│   │   ├── callback_client.py  #     网关→Callback 传输（WS 隧道/HTTP 双通道）
+│   │   ├── gateway_client.py   #     Callback→网关 传输
+│   │   ├── group_maintenance.py #    群聊维护编排（空闲判定/批量解散，平台无关）
 │   │   ├── ws_tunnel_client.py #     WS 隧道客户端
 │   │   ├── ws_registry.py      #     WS 连接管理
 │   │   └── card_cache.py       #     卡片状态缓存
@@ -200,13 +216,23 @@ hooks/ ──► server/ (via Socket)   IPC 通信
 handlers/ ──► services/   HTTP 处理调用业务逻辑
 handlers/ ──► models/     使用数据结构
 handlers/ ──► stores/     访问持久化
+handlers/ ──► platforms/  经工厂调用平台适配器（出站 / 事件解析 / 注册授权 /
+                          网关端点声明，见 gateway_routes）
 services/ ──► models/     使用数据结构
 services/ ──► stores/     访问持久化
+services/ ──► platforms/  传输层注入平台附加字段、群聊编排判定平台能力
 handlers/ ──► utils/      复用通用工具（HTTP/shell/并发等）
 services/ ──► utils/      复用通用工具
 stores/   ──► utils/      复用原子 JSON 等通用工具
 
-✗ services/ ──► handlers/     禁止反向引用
+platforms/ ──► services/        适配器借用传输层与平台 API 封装（与上两条构成
+                                特许双向环，函数内延迟导入消解 import 环）
+platforms/ ──► handlers/feishu/ 特许：平台实现把事件 / 授权 / 卡片构建转交
+                                飞书业务模块（组装点角色，微信接入时同构）
+platforms/ 自含 models.py（IMEvent 等契约类型），不依赖顶层 models/
+
+✗ services/ ──► handlers/     禁止反向引用（既有例外仅 ws_tunnel_client 的
+                              /cb/* RPC 路由表，待中立注册表收口后消除）
 ✗ models/   ──► services/     禁止反向引用
 ✗ stores/   ──► services/     禁止反向引用（store 是叶子）
 ✗ lib/      ──► hooks/        禁止反向引用
@@ -214,20 +240,21 @@ stores/   ──► utils/      复用原子 JSON 等通用工具
 
 ### 2.3 已知技术债
 
-> 行数为 `wc -l` 原始值（2026-06-20 实测）；约束按代码行 ≤500（去空行/注释），原始行数 >650 基本可判定超标。Roadmap Issue 编号见 docs/REFACTORING_ROADMAP.md。
+> 行数为 `wc -l` 原始值（2026-06-20 实测，标注更新值的为 2026-08-29 复核）；约束按代码行 ≤500（去空行/注释），原始行数 >650 基本可判定超标。Roadmap Issue 编号见 docs/REFACTORING_ROADMAP.md。
 
 | 文件 | 行数 | 问题 | 优先级 | 状态 |
 |------|------|------|--------|------|
-| `lib/feishu.sh` | 2371 | 混合卡片构建/API 调用/模板/脱敏 | P0 | 待拆（Issue 2） |
-| `services/feishu_api.py` | 1536 | 混合 HTTP 客户端/Token 管理/消息发送 | P1 | 待拆（Issue 3） |
-| `handlers/register.py` | 1279 | 网关注册(HTTP) + WS 隧道授权 + 授权卡片构建 + 归属验证混合 | P1 | 待拆（Issue 12） |
-| `handlers/callback.py` | 1151 | 回调侧所有 `/cb/*` 端点总入口（24 个 handler），决策/目录/会话/静音/通知配置混合 | P1 | 待拆（Issue 13） |
-| `agents/__init__.py` | 851 | AgentAdapter 基类 + 工厂 + 共享启动/会话捕获 + env/模板工具混合在包入口 | P2 | 待评估 |
+| `lib/feishu.sh` | ~~2371~~ 2180 | 混合卡片构建/API 调用/模板/脱敏 | P0 | 待拆（Issue 2） |
+| `services/feishu_api.py` | ~~1536~~ 1638 | 混合 HTTP 客户端/Token 管理/消息发送 | P1 | 待拆（Issue 3） |
+| `handlers/register.py` | ~~1279~~ 363 | ~~网关注册(HTTP) + WS 隧道授权 + 授权卡片构建 + 归属验证混合~~ | P1 | ✅ 授权飞书形态已拆出 `feishu/authorization.py`，只留平台无关编排（Issue 12） |
+| `handlers/feishu/authorization.py` | 895 | 授权卡片构建/发送 + HTTP/WS 授权结果 + 管理员通知混合 | P2 | 待评估（Issue 12 后续） |
+| `handlers/callback.py` | ~~1151~~ 1175 | 回调侧所有 `/cb/*` 端点总入口（24 个 handler），决策/目录/会话/静音/通知配置混合 | P1 | 待拆（Issue 13） |
+| `agents/__init__.py` | ~~851~~ 833 | AgentAdapter 基类 + 工厂 + 共享启动/会话捕获 + env/模板工具混合在包入口 | P2 | 待评估 |
 | `services/ws_registry.py` | 778 | pending 连接生命周期 + 授权预备 + 卡片冷却 + token/binding 暂存混合 | P2 | 待评估 |
-| `handlers/feishu/card_action.py` | 728 | 卡片交互 + 状态更新；Issue 1 拆分后又涨过 500 | P2 | 待评估 |
-| `main.py` | 682 | 初始化序列 + Socket 处理 + 部署条件判断 | P1 | 待拆（Issue 4） |
+| `handlers/feishu/card_action.py` | ~~728~~ 712 | 卡片交互 + 状态更新；Issue 1 拆分后又涨过 500 | P2 | 待评估 |
+| `main.py` | ~~682~~ 668 | 初始化序列 + Socket 处理 + 部署条件判断 | P1 | 待拆（Issue 4） |
 | `stores/directory_store.py` | 641 | store 内含目录静音决策/向上遍历/遗留迁移等较重逻辑 | P3 | 待评估 |
-| `stores/session_chat_store.py` | 632 | store 承载会话生命周期大量业务方法（env 覆盖/静音/迁移/解散） | P3 | 待评估 |
+| `stores/session_chat_store.py` | ~~632~~ 921 | store 承载会话生命周期大量业务方法（env 覆盖/静音/迁移/解散） | P3 | 待评估 |
 | 全局单例 | 8 处 `get_instance` | 单例难以测试（stores 已统一 `JsonStore` 基类，定义点收敛） | P2 | 待治理（Issue 6） |
 | `handlers/feishu.py` | ~~3224~~ | 混合事件处理/消息构建/回调路由 | P0 | ✅ 已拆分为 `feishu/` 包（Issue 1） |
 

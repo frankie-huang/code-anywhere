@@ -1603,9 +1603,13 @@ class SetupInit:
 
     # --- .env 配置步骤（从原 main() 迁移，逻辑不变） ---
 
+    def _get_gateway_url(self) -> str:
+        """读网关地址：新键 GATEWAY_URL 优先，兼容老 .env 里的 FEISHU_GATEWAY_URL"""
+        return self.env.get('GATEWAY_URL') or self.env.get('FEISHU_GATEWAY_URL')
+
     def _configure_feishu_connection(self):
         TerminalUI.print_section("飞书连接")
-        existing_gateway = self.env.get('FEISHU_GATEWAY_URL')
+        existing_gateway = self._get_gateway_url()
         default_deploy = 1 if existing_gateway else 0
 
         self.deploy_idx = TerminalUI.select_option("选择部署模式", [
@@ -1616,11 +1620,14 @@ class SetupInit:
         self.env.set('FEISHU_SEND_MODE', 'openapi')
 
         if self.deploy_idx == 0:
-            if self.env.get('FEISHU_GATEWAY_URL'):
-                TerminalUI.select_action_or_exit("检测到已有分离部署配置，切换到单机模式需要清除 FEISHU_GATEWAY_URL", options=[
+            if self._get_gateway_url():
+                TerminalUI.select_action_or_exit("检测到已有分离部署配置，切换到单机模式需要清除 GATEWAY_URL", options=[
                     ("确认清除", ""), ("取消", "退出初始化")])
-                self.env.set('FEISHU_GATEWAY_URL', '')
-                TerminalUI.print_info("FEISHU_GATEWAY_URL 将被清除")
+                # 两个键都清：老 .env 里可能只有旧键（env.set 找不到键会追加，故先判断）
+                for key in ('GATEWAY_URL', 'FEISHU_GATEWAY_URL'):
+                    if self.env.get(key):
+                        self.env.set(key, '')
+                TerminalUI.print_info("GATEWAY_URL 将被清除")
 
             app_id = TerminalUI.input_or_keep("FEISHU_APP_ID", existing=self.env.get('FEISHU_APP_ID'), required=True)
             app_secret = TerminalUI.input_or_keep("FEISHU_APP_SECRET", existing=self.env.get('FEISHU_APP_SECRET'),
@@ -1653,9 +1660,12 @@ class SetupInit:
                     return "请输入 http://、https://、ws:// 或 wss:// 开头的地址"
                 return None
 
-            gateway_url = TerminalUI.input_or_keep("FEISHU_GATEWAY_URL", existing=existing_gateway,
+            gateway_url = TerminalUI.input_or_keep("GATEWAY_URL", existing=existing_gateway,
                                                    required=True, validate=_validate_gateway_url)
-            self.env.set('FEISHU_GATEWAY_URL', gateway_url)
+            self.env.set('GATEWAY_URL', gateway_url)
+            # 清掉旧键，避免 .env 里两个键留下不一致的值
+            if self.env.get('FEISHU_GATEWAY_URL'):
+                self.env.set('FEISHU_GATEWAY_URL', '')
 
     def _configure_owner_id(self):
         TerminalUI.print_section("用户身份")
@@ -1725,7 +1735,7 @@ class SetupInit:
         if self.deploy_idx == 0 and not self.has_lark_oapi:
             needs_public_url = True
         elif self.deploy_idx == 1:
-            actual_gateway = self.env.get('FEISHU_GATEWAY_URL')
+            actual_gateway = self._get_gateway_url()
             if actual_gateway and not actual_gateway.startswith('ws'):
                 needs_public_url = True
 
@@ -2073,7 +2083,7 @@ class SetupInit:
 
         # 重新加载 .env 检查部署模式
         self.env.load()
-        gateway = self.env.get('FEISHU_GATEWAY_URL')
+        gateway = self._get_gateway_url()
         if gateway:
             return  # 分离部署不需要
 

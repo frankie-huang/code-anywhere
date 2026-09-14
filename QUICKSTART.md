@@ -286,7 +286,7 @@ VSCODE_SSH_PROXY_PORT=9527    # 需与本地代理端口一致
 |------|------|----------|
 | 个人使用，快速体验 | Webhook | `FEISHU_WEBHOOK_URL` |
 | 飞书内响应，回复继续会话 | OpenAPI | App ID + Secret + OWNER_ID |
-| 多人/多实例部署 | OpenAPI 分离 | 上述 + `FEISHU_GATEWAY_URL` |
+| 多人/多实例部署 | OpenAPI 分离 | 上述 + `GATEWAY_URL` |
 
 ## 更多文档
 

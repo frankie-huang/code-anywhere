@@ -4,7 +4,7 @@
 
 Token 格式: base64url(timestamp) + "." + base64url(signature)
 - timestamp: Unix 时间戳（秒）
-- signature: HMAC-SHA256(FEISHU_APP_SECRET, owner_id + timestamp)
+- signature: HMAC-SHA256(平台密钥, owner_id + timestamp)
 """
 
 import base64
@@ -51,8 +51,8 @@ def generate_auth_token(app_secret: str, owner_id: str) -> str:
     """生成 auth_token
 
     Args:
-        app_secret: 飞书应用密钥（FEISHU_APP_SECRET）
-        owner_id: 飞书用户 ID
+        app_secret: 平台密钥（来源经 IMAdapter.get_auth_secret）
+        owner_id: IM 平台用户标识
 
     Returns:
         auth_token 字符串，格式为 {timestamp_b64}.{signature_b64}
@@ -86,8 +86,8 @@ def verify_auth_token(
 
     Args:
         auth_token: 待验证的 token
-        owner_id: 飞书用户 ID
-        app_secret: 飞书应用密钥（FEISHU_APP_SECRET）
+        owner_id: IM 平台用户标识
+        app_secret: 平台密钥（来源经 IMAdapter.get_auth_secret）
 
     Returns:
         (is_valid, timestamp): 验证结果和 token 中的时间戳

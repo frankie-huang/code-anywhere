@@ -11,6 +11,7 @@ Feishu Command - 命令处理函数
 - _handle_attach_command: /attach 命令处理
 - _handle_clear_command: /clear 命令处理
 - _handle_stop_command: /stop 命令处理
+- _handle_copy_command: /copy 命令处理
 - _handle_users_command: /users 命令处理
 """
 
@@ -22,13 +23,14 @@ import time
 import uuid
 from typing import Any, Dict, List, Tuple
 
+from platforms.models import IMEvent
 from utils.concurrency import run_in_background
 from services.session_facade import SessionFacade
+from services.group_maintenance import batch_dissolve_groups, find_idle_group_chats
 
 from .utils import (
     _SESSION_NOT_FOUND_HINT,
     _sanitize_user_content, _should_reply_in_thread,
-    _get_binding_from_event,
     _build_agent_commands_from_binding,
     _resolve_agent_command_from_binding,
 )
@@ -43,10 +45,11 @@ from .forward import (
     _forward_new_request_for_default_dir,
     _forward_attach_request,
     _forward_stop_request,
+    _forward_copy_request,
     _fetch_recent_dirs_from_callback,
 )
 from .card_session import _build_new_session_card
-from .group import batch_dissolve_groups, find_idle_group_chats, _send_groups_card
+from .group import _send_groups_card
 
 logger = logging.getLogger(__name__)
 
@@ -147,10 +150,8 @@ def _send_new_session_card(binding: dict, owner_id: str, chat_id: str,
     card_json = json.dumps(card, ensure_ascii=True, indent=2)
     logger.info(f"[feishu] Dir selector card JSON:\n{card_json}")
 
-    if message_id:
-        success, sent_message_id = service.reply_card(json.dumps(card, ensure_ascii=False), message_id, reply_in_thread)
-    else:
-        success, sent_message_id = service.send_card(json.dumps(card, ensure_ascii=False), receive_id=chat_id, receive_id_type='chat_id')
+    success, sent_message_id = service.reply_or_send_card(
+        json.dumps(card, ensure_ascii=False), chat_id, 'chat_id', message_id, reply_in_thread)
 
     if success:
         logger.info(f"[feishu] Sent new session card to {chat_id}, card_msg_id={sent_message_id}")
@@ -159,19 +160,17 @@ def _send_new_session_card(binding: dict, owner_id: str, chat_id: str,
         _send_notice_message(chat_id, "会话卡片发送失败，请稍后重试", message_id)
 
 
-def _handle_new_command(data: dict, args: str):
+def _handle_new_command(event: IMEvent, args: str, binding: dict):
     """处理 /new 指令，发起新会话
 
     Args:
-        data: 飞书事件数据
+        event: 入站事件
         args: 参数部分（不含 /new）
+        binding: 生效的绑定信息
     """
-    event = data.get('event', {})
-    message = event.get('message', {})
-
-    message_id = message.get('message_id', '')
-    chat_id = message.get('chat_id', '')
-    sender_id = event.get('sender', {}).get('sender_id', {}).get('user_id', '')
+    message_id = event.message_id
+    chat_id = event.chat_id
+    sender_id = event.sender_user_id
 
     # 解析指令参数（支持 --dir= 和 --cmd=）
     success, project_dir, cmd_arg, prompt = _parse_command_args(args)
@@ -179,12 +178,11 @@ def _handle_new_command(data: dict, args: str):
         run_in_background(_send_notice_message, (chat_id, "参数格式错误，正确格式：`/new --dir=/path/to/project [--cmd=0] prompt`", message_id))
         return
 
-    binding = _get_binding_from_event(event)
     if not binding:
         run_in_background(_send_notice_message, (chat_id, "您尚未注册，无法使用此功能", message_id))
         return
     owner_id = binding.get('_owner_id', '')
-    msg_chat_type = message.get('chat_type', '')
+    msg_chat_type = event.chat_type
 
     # 从上下文继承 project_dir 和 command（用户未显式指定时）
     # 优先级：--dir/--cmd 参数 > 消息上下文解析到的旧 session > 默认值
@@ -195,7 +193,7 @@ def _handle_new_command(data: dict, args: str):
 
     if need_inherit:
         # 两条分支统一走 resolve_from_message：parent_id / group chat 的路由定位
-        route_info = SessionFacade.resolve_from_message(data, binding)
+        route_info = SessionFacade.resolve_from_message(binding, event)
         route_source = route_info.get('source', '')
         if SessionFacade.RouteSource.is_resolved(route_source):
             inherited_dir = route_info.get('project_dir', '')
@@ -271,26 +269,23 @@ def _handle_new_command(data: dict, args: str):
         run_in_background(_forward_new_request, (binding, new_session_id, project_dir, prompt, chat_id, message_id, sender_id, msg_chat_type, command, agent_type))
 
 
-def _handle_reply_command(data: dict, args: str):
+def _handle_reply_command(event: IMEvent, args: str, binding: dict):
     """处理 /reply 指令，在回复消息时指定 Claude Command 继续会话
 
     仅在回复消息时可用。支持 --cmd= 参数。
 
     Args:
-        data: 飞书事件数据
+        event: 入站事件
         args: 参数部分（不含 /reply）
+        binding: 生效的绑定信息
     """
-    event = data.get('event', {})
-    message = event.get('message', {})
-
-    message_id = message.get('message_id', '')
-    chat_id = message.get('chat_id', '')
-    parent_id = message.get('parent_id', '')
-    sender_id = event.get('sender', {}).get('sender_id', {}).get('user_id', '')
-    chat_type = message.get('chat_type', '')
+    message_id = event.message_id
+    chat_id = event.chat_id
+    parent_id = event.parent_id
+    sender_id = event.sender_user_id
+    chat_type = event.chat_type
 
     # /reply 需要回复消息或在 group 模式群聊中使用
-    binding = _get_binding_from_event(event)
     session_mode = binding.get('session_mode', '') if binding else ''
     if not parent_id and not (session_mode == 'group' and chat_type == 'group'):
         run_in_background(_send_notice_message, (chat_id, "`/reply` 指令仅支持在回复消息时使用，或在群聊模式的群聊中直接使用", message_id))
@@ -321,7 +316,7 @@ def _handle_reply_command(data: dict, args: str):
         command = result
 
     # 路由 session（统一走 SessionFacade）
-    route_info = SessionFacade.resolve_from_message(data, binding)
+    route_info = SessionFacade.resolve_from_message(binding, event)
     route_source = route_info['source']
 
     if SessionFacade.RouteSource.is_parent_not_found(route_source):
@@ -358,21 +353,20 @@ def _handle_reply_command(data: dict, args: str):
         run_in_background(_forward_continue_request, (binding, session_id, session_project_dir, prompt, chat_id, message_id, sender_id, command, agent_type))
 
 
-def _handle_users_command(data: dict, args: str):
+def _handle_users_command(event: IMEvent, args: str, binding: dict):
     """处理 /users 指令，查看已注册用户和在线状态
 
     Args:
-        data: 飞书事件数据
+        event: 入站事件
         args: 参数部分（不含 /users，当前未使用）
+        binding: 生效的绑定信息（本命令不使用，管理员校验在调用方完成）
     """
     from config import FEISHU_OWNER_ID as gateway_owner_id
     from stores.binding_store import BindingStore
     from services.ws_registry import WebSocketRegistry
 
-    event = data.get('event', {})
-    message = event.get('message', {})
-    message_id = message.get('message_id', '')
-    chat_id = message.get('chat_id', '')
+    message_id = event.message_id
+    chat_id = event.chat_id
 
     # 获取数据
     binding_store = BindingStore.get_instance()
@@ -386,7 +380,7 @@ def _handle_users_command(data: dict, args: str):
     run_in_background(_send_users_status_card, (chat_id, card, message_id))
 
 
-def _handle_groups_command(data: dict, args: str) -> None:
+def _handle_groups_command(event: IMEvent, args: str, binding: dict) -> None:
     """处理 /groups 命令：列出或解散群聊
 
     用法：
@@ -397,11 +391,8 @@ def _handle_groups_command(data: dict, args: str) -> None:
         /groups dissolve /path        - 解散指定目录的群聊（精准匹配）
         /groups dissolve /path/**     - 解散指定目录及子目录的群聊
     """
-    event = data.get('event', {})
-    message = event.get('message', {})
-    chat_id = message.get('chat_id', '')
-    message_id = message.get('message_id', '')
-    binding = _get_binding_from_event(event)
+    chat_id = event.chat_id
+    message_id = event.message_id
 
     args = args.strip()
 
@@ -450,7 +441,7 @@ def _dissolve_groups(binding: Dict[str, Any], payload: dict,
 
     执行顺序：
         1. gateway 本地定位目标 chat_ids（按 seqs 或 all）
-        2. 调 batch_dissolve_groups（先通知 callback 标记 dissolved，再飞书 API 解散 + 清 GroupChatStore）
+        2. 调 batch_dissolve_groups（先通知 callback 标记 dissolved，再平台 API 解散 + 清 GroupChatStore）
         3. 清 GroupSessionStore 对应条目
     """
     from stores.group_chat_store import GroupChatStore
@@ -508,7 +499,7 @@ def _dissolve_groups(binding: Dict[str, Any], payload: dict,
         _send_notice_message(chat_id, "没有找到可解散的群聊", message_id)
         return
 
-    # 2) 调 batch_dissolve_groups（先通知 callback 标记 dissolved，再飞书 API 解散 + 清 GroupChatStore）
+    # 2) 调 batch_dissolve_groups（先通知 callback 标记 dissolved，再平台 API 解散 + 清 GroupChatStore）
     result = batch_dissolve_groups(binding, target_chat_ids)
     dissolved_items = result.get('dissolved_items', [])
     failed = result.get('failed', [])
@@ -533,18 +524,16 @@ def _dissolve_groups(binding: Dict[str, Any], payload: dict,
     _send_notice_message(chat_id, msg, message_id)
 
 
-def _handle_attach_command(data: dict, args: str) -> None:
+def _handle_attach_command(event: IMEvent, args: str, binding: dict) -> None:
     """处理 /attach <session_id_prefix> 命令：将 session 绑定到当前群聊
 
     仅支持在群聊中使用。session_id 前缀至少 8 字符，唯一匹配时执行绑定。
     """
     MIN_PREFIX_LEN = 8
 
-    event = data.get('event', {})
-    message = event.get('message', {})
-    chat_id = message.get('chat_id', '')
-    message_id = message.get('message_id', '')
-    chat_type = message.get('chat_type', '')
+    chat_id = event.chat_id
+    message_id = event.message_id
+    chat_type = event.chat_type
 
     if chat_type != 'group':
         run_in_background(_send_notice_message,
@@ -558,28 +547,24 @@ def _handle_attach_command(data: dict, args: str) -> None:
                            message_id))
         return
 
-    binding = _get_binding_from_event(event)
     run_in_background(_forward_attach_request, (binding, prefix, chat_id, message_id))
 
 
-def _handle_clear_command(data: dict, args: str) -> None:
+def _handle_clear_command(event: IMEvent, args: str, binding: dict) -> None:
     """处理 /clear 命令：清空当前群聊会话，预创建新 session
 
     仅支持 group 模式的群聊中使用。解绑旧 session 并预创建新 session（继承
     project_dir + command），下次发送消息自动启动新 Agent 进程。
     """
-    event = data.get('event', {})
-    message = event.get('message', {})
-    chat_id = message.get('chat_id', '')
-    message_id = message.get('message_id', '')
-    chat_type = message.get('chat_type', '')
+    chat_id = event.chat_id
+    message_id = event.message_id
+    chat_type = event.chat_type
 
     if chat_type != 'group':
         run_in_background(_send_notice_message,
                           (chat_id, "`/clear` 仅支持在群聊中使用", message_id))
         return
 
-    binding = _get_binding_from_event(event)
     if not binding:
         run_in_background(_send_notice_message,
                           (chat_id, "您尚未注册，无法使用此功能", message_id))
@@ -639,20 +624,17 @@ def _handle_clear_command(data: dict, args: str) -> None:
                        message_id))
 
 
-def _handle_stop_command(data: dict, args: str) -> None:
+def _handle_stop_command(event: IMEvent, args: str, binding: dict) -> None:
     """处理 /stop 命令：停止当前执行中的 Agent 进程并清空排队指令"""
-    event = data.get('event', {})
-    message = event.get('message', {})
-    chat_id = message.get('chat_id', '')
-    message_id = message.get('message_id', '')
+    chat_id = event.chat_id
+    message_id = event.message_id
 
-    binding = _get_binding_from_event(event)
     if not binding:
         run_in_background(_send_notice_message,
                           (chat_id, "您尚未注册，无法使用此功能", message_id))
         return
 
-    route_info = SessionFacade.resolve_from_message(data, binding)
+    route_info = SessionFacade.resolve_from_message(binding, event)
     route_source = route_info['source']
 
     if not SessionFacade.RouteSource.is_resolved(route_source):
@@ -665,4 +647,30 @@ def _handle_stop_command(data: dict, args: str) -> None:
     session_id = route_info['session_id']
 
     run_in_background(_forward_stop_request,
+                      (binding, session_id, chat_id, message_id))
+
+
+def _handle_copy_command(event: IMEvent, args: str, binding: dict) -> None:
+    """处理 /copy 命令：复制会话最后答复为 markdown 代码块"""
+    chat_id = event.chat_id
+    message_id = event.message_id
+
+    if not binding:
+        run_in_background(_send_notice_message,
+                          (chat_id, "您尚未注册，无法使用此功能", message_id))
+        return
+
+    route_info = SessionFacade.resolve_from_message(binding, event)
+    route_source = route_info['source']
+
+    if not SessionFacade.RouteSource.is_resolved(route_source):
+        run_in_background(_send_notice_message,
+                          (chat_id,
+                           "无法确定要复制的会话。请在群聊中使用 /copy，或回复某条会话消息后发送。",
+                           message_id))
+        return
+
+    session_id = route_info['session_id']
+
+    run_in_background(_forward_copy_request,
                       (binding, session_id, chat_id, message_id))

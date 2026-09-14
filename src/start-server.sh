@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# src/start-server.sh - 启动/停止 code-anywhere 权限回调服务
+# src/start-server.sh - 启动/停止 code-anywhere 回调服务
 #
 # 用法:
 #   ./src/start-server.sh [start|stop|restart|status|state]
@@ -163,7 +163,7 @@ start_service() {
         return 0
     fi
 
-    echo "Starting code-anywhere Permission Callback Server..."
+    echo "Starting code-anywhere Callback Server..."
 
     # 验证 .env 中的 PYTHON_PATH（如果存在）
     validate_env_python_path
@@ -249,23 +249,28 @@ stop_service() {
     fi
 
     local pid=$(get_pid)
-    echo "Stopping service (PID: $pid)..."
+    echo -n "Stopping service (PID: $pid)"
 
     # 尝试优雅关闭
     kill "$pid" 2>/dev/null
 
-    # 等待进程结束（最多 5 秒）
+    # 等待进程优雅退出：正常约 3.5 秒（WS 通知 1s + 各客户端停止），
+    # 异常路径下各 join 会耗满超时，故留出充足余量，避免被下方 SIGKILL 打断
     local count=0
-    while is_running && [ $count -lt 5 ]; do
+    while is_running && [ $count -lt 15 ]; do
+        echo -n "."
         sleep 1
         count=$((count + 1))
     done
 
     # 如果还在运行，强制终止
     if is_running; then
+        echo " timeout."
         echo "Force killing service..."
         kill -9 "$pid" 2>/dev/null
         sleep 1
+    else
+        echo " done."
     fi
 
     # 清理 socket 文件（优先从 state 读取实际运行时路径，降级读 .env）

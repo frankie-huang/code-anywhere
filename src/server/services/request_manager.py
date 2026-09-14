@@ -96,7 +96,7 @@ class RequestManager:
 
         处理流程：
             1. 检查请求是否存在且状态有效
-            2. 通过 Socket 连接发送决策给 permission-notify.sh
+            2. 通过 Socket 连接发送决策给 permission.sh
             3. 标记请求为已解决并关闭连接
         """
         from models.decision import Decision

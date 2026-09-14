@@ -22,6 +22,7 @@ from config import (
     FEISHU_APP_ID,
     FEISHU_APP_SECRET,
 )
+from utils.http_client import DEFAULT_HTTP_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
@@ -37,9 +38,6 @@ TOKEN_EXPIRE_SECONDS = 7200
 
 # 提前刷新时间（秒），避免临界点过期
 TOKEN_REFRESH_BUFFER = 300  # 5 分钟
-
-# HTTP 请求超时（秒）
-HTTP_TIMEOUT = 10
 
 # 飞书敏感信息拦截错误码
 # 230022: 消息内容包含敏感信息
@@ -317,7 +315,7 @@ def _http_request(
     method: str = 'GET',
     headers: Optional[Dict[str, str]] = None,
     data: Optional[bytes] = None,
-    timeout: int = HTTP_TIMEOUT
+    timeout: int = DEFAULT_HTTP_TIMEOUT
 ) -> Tuple[bool, Dict[str, Any]]:
     """发送 HTTP 请求
 
@@ -799,6 +797,61 @@ class MessageSender:
             payload_extra=payload_extra,
             log_prefix='Post reply'
         )
+
+    def reply_or_send_card(
+        self,
+        card_json: str,
+        receive_id: str,
+        receive_id_type: str,
+        message_id: str = '',
+        reply_in_thread: bool = False
+    ) -> Tuple[bool, str]:
+        """回复卡片消息，reply 失败时降级为按 receive_id 发送新消息
+
+        reply_to 可能指向本网关不可用的消息（网关切换后跨租户、消息已被撤回等），
+        这类 ID 走 reply API 必然失败，降级发送避免整条通知丢失。
+
+        Returns:
+            (success, message_id or error)
+        """
+        if message_id:
+            success, result = self.reply_card(card_json, message_id, reply_in_thread)
+            if success:
+                return True, result
+            logger.warning("[feishu-api] Card reply failed (%s), fallback to send by %s", result, receive_id_type)
+        return self.send_card(card_json, receive_id, receive_id_type)
+
+    def reply_or_send_text(
+        self,
+        text: str,
+        receive_id: str,
+        receive_id_type: str,
+        message_id: str = '',
+        reply_in_thread: bool = False
+    ) -> Tuple[bool, str]:
+        """回复文本消息，reply 失败时降级为按 receive_id 发送新消息（语义同 reply_or_send_card）"""
+        if message_id:
+            success, result = self.reply_text(text, message_id, reply_in_thread)
+            if success:
+                return True, result
+            logger.warning("[feishu-api] Text reply failed (%s), fallback to send by %s", result, receive_id_type)
+        return self.send_text(text, receive_id, receive_id_type)
+
+    def reply_or_send_post(
+        self,
+        content: Dict[str, Any],
+        receive_id: str,
+        receive_id_type: str,
+        message_id: str = '',
+        reply_in_thread: bool = False
+    ) -> Tuple[bool, str]:
+        """回复富文本消息，reply 失败时降级为按 receive_id 发送新消息（语义同 reply_or_send_card）"""
+        if message_id:
+            success, result = self.reply_post(content, message_id, reply_in_thread)
+            if success:
+                return True, result
+            logger.warning("[feishu-api] Post reply failed (%s), fallback to send by %s", result, receive_id_type)
+        return self.send_post(content, receive_id, receive_id_type)
 
     def add_reaction(
         self,
@@ -1458,6 +1511,51 @@ class FeishuAPIService:
             return False, "Feishu API service not enabled"
 
         return self._message_sender.reply_post(content, message_id, reply_in_thread)
+
+    def reply_or_send_card(
+        self,
+        card_json: str,
+        receive_id: str,
+        receive_id_type: str,
+        message_id: str = '',
+        reply_in_thread: bool = False
+    ) -> Tuple[bool, str]:
+        """回复卡片消息，reply 失败时降级为按 receive_id 发送新消息"""
+        if not self._enabled:
+            return False, "Feishu API service not enabled"
+
+        return self._message_sender.reply_or_send_card(
+            card_json, receive_id, receive_id_type, message_id, reply_in_thread)
+
+    def reply_or_send_text(
+        self,
+        text: str,
+        receive_id: str,
+        receive_id_type: str,
+        message_id: str = '',
+        reply_in_thread: bool = False
+    ) -> Tuple[bool, str]:
+        """回复文本消息，reply 失败时降级为按 receive_id 发送新消息"""
+        if not self._enabled:
+            return False, "Feishu API service not enabled"
+
+        return self._message_sender.reply_or_send_text(
+            text, receive_id, receive_id_type, message_id, reply_in_thread)
+
+    def reply_or_send_post(
+        self,
+        content: Dict[str, Any],
+        receive_id: str,
+        receive_id_type: str,
+        message_id: str = '',
+        reply_in_thread: bool = False
+    ) -> Tuple[bool, str]:
+        """回复富文本消息，reply 失败时降级为按 receive_id 发送新消息"""
+        if not self._enabled:
+            return False, "Feishu API service not enabled"
+
+        return self._message_sender.reply_or_send_post(
+            content, receive_id, receive_id_type, message_id, reply_in_thread)
 
     def add_reaction(
         self,

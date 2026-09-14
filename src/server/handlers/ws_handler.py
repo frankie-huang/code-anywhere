@@ -62,8 +62,8 @@ def handle_ws_tunnel(handler: Any, params: Dict[str, List[str]]) -> None:
     2. 握手后客户端发送 register 消息
     3. 网关检查绑定记录和 auth_token：
        - 有绑定 + token 匹配：同一终端重连，直接续期
-       - 有绑定 + token 不匹配：新终端换绑，发飞书授权卡片
-       - 无绑定：首次注册，发飞书授权卡片
+       - 有绑定 + token 不匹配：新终端换绑，发起平台授权（飞书为发授权卡片）
+       - 无绑定：首次注册，发起平台授权（飞书为发授权卡片）
     """
     from services.ws_registry import WebSocketRegistry
 
@@ -121,13 +121,28 @@ def handle_ws_tunnel(handler: Any, params: Dict[str, List[str]]) -> None:
             pass
 
 
+def ws_send_auth_ok(sock: 'socket.socket', auth_token: str) -> None:
+    """通过 WebSocket 发送 auth_ok 消息（含平台附加字段，飞书为 bot_open_id）
+
+    WS 模式首次授权和续期重连共用此函数，确保 auth_ok 消息格式一致。
+    """
+    auth_ok_data = {
+        'type': 'auth_ok',
+        'auth_token': auth_token
+    }
+    from platforms import get_im_adapter
+    auth_ok_data.update(get_im_adapter().get_gateway_metadata())
+    msg = json.dumps(auth_ok_data)
+    ws_send_text(sock, msg)
+
+
 def _process_tunnel_connection(sock: socket.socket, handler: Any, owner_id: str, registry: Any) -> None:
     """处理握手后的隧道连接：接收 register 消息，分发认证路径，进入消息循环
 
     认证路径：
     - token 匹配：同一终端重连，直接续期（发 auth_ok，等 auth_ok_ack）
-    - token 不匹配/缺失：新终端换绑，发飞书授权卡片
-    - 无绑定记录：首次注册，发飞书授权卡片
+    - token 不匹配/缺失：新终端换绑，发起平台授权（飞书为发授权卡片）
+    - 无绑定记录：首次注册，发起平台授权（飞书为发授权卡片）
 
     Args:
         sock: 已完成握手的 WebSocket socket
@@ -135,7 +150,6 @@ def _process_tunnel_connection(sock: socket.socket, handler: Any, owner_id: str,
         owner_id: 飞书用户 ID
         registry: WebSocketRegistry 实例
     """
-    from config import FEISHU_APP_SECRET
     from stores.binding_store import BindingStore
 
     client_ip = handler.get_client_ip()
@@ -197,7 +211,9 @@ def _process_tunnel_connection(sock: socket.socket, handler: Any, owner_id: str,
                 logger.info("[ws/tunnel] auth_token matched, renewing for %s", owner_id)
                 from services.auth_token import generate_auth_token
 
-                new_token = generate_auth_token(FEISHU_APP_SECRET, owner_id)
+                from platforms import get_im_adapter
+                new_token = generate_auth_token(
+                    get_im_adapter().get_auth_secret(binding_params), owner_id)
 
                 # 添加到 pending 并暂存 auth_token 和绑定参数，
                 # 旧连接保持不动（继续路由请求），auth_ok_ack 收到后由 promote_pending 原子替换
@@ -211,7 +227,6 @@ def _process_tunnel_connection(sock: socket.socket, handler: Any, owner_id: str,
                 registry.set_pending_binding_params(owner_id, request_id, pending_params)
 
                 # 发送新 token，等待消息循环中的 auth_ok_ack 完成认证
-                from handlers.register import ws_send_auth_ok
                 ws_send_auth_ok(sock, new_token)
 
                 # 进入消息循环（pending 状态，等待 auth_ok_ack）
@@ -235,10 +250,10 @@ def _process_tunnel_connection(sock: socket.socket, handler: Any, owner_id: str,
                     ws_send_close(sock, 1008, 'too many pending connections')
                     return
 
-                from handlers.register import handle_ws_rebind_registration
-                card_sent = handle_ws_rebind_registration(
-                    owner_id, request_id, client_ip, old_ip,
-                    binding_params=binding_params
+                from platforms import get_im_adapter
+                card_sent = get_im_adapter().start_ws_authorization(
+                    owner_id, client_ip, request_id, binding_params,
+                    old_ip=old_ip
                 )
                 if card_sent:
                     registry.set_card_cooldown(owner_id)
@@ -247,7 +262,7 @@ def _process_tunnel_connection(sock: socket.socket, handler: Any, owner_id: str,
                 _ws_message_loop(sock, owner_id, registry, is_pending=True, request_id=request_id)
                 return
 
-        # 无现有绑定，添加到 pending 并发送飞书授权卡片
+        # 无现有绑定，添加到 pending 并发起平台授权
         if not registry.check_card_cooldown(owner_id):
             logger.warning("[ws/tunnel] Card cooldown for %s, rejecting", owner_id)
             ws_send_close(sock, 1008, 'too many requests')
@@ -258,11 +273,10 @@ def _process_tunnel_connection(sock: socket.socket, handler: Any, owner_id: str,
             ws_send_close(sock, 1008, 'too many pending connections')
             return
 
-        # 触发 WS 注册流程（发送飞书授权卡片）
-        from handlers.register import handle_ws_registration
-        card_sent = handle_ws_registration(
-            owner_id, request_id, client_ip,
-            binding_params=binding_params
+        # 触发 WS 注册授权（飞书为发送授权卡片）
+        from platforms import get_im_adapter
+        card_sent = get_im_adapter().start_ws_authorization(
+            owner_id, client_ip, request_id, binding_params
         )
         if card_sent:
             registry.set_card_cooldown(owner_id)

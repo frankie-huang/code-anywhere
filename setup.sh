@@ -709,11 +709,13 @@ if [ "$DEPLOY_MODE" = "gateway" ]; then
         fi
     fi
 elif [ "$DEPLOY_MODE" = "standalone" ]; then
-    ENV_GATEWAY_URL=$(get_env_value "FEISHU_GATEWAY_URL" "$ENV_FILE")
+    # 新键优先，兼容老 .env 里的 FEISHU_GATEWAY_URL
+    ENV_GATEWAY_URL=$(get_env_value "GATEWAY_URL" "$ENV_FILE")
+    [ -z "$ENV_GATEWAY_URL" ] && ENV_GATEWAY_URL=$(get_env_value "FEISHU_GATEWAY_URL" "$ENV_FILE")
     if [ -n "$ENV_GATEWAY_URL" ]; then
         echo ""
         print_warning "检测到 .env 中存在网关配置："
-        echo "  - FEISHU_GATEWAY_URL=$ENV_GATEWAY_URL"
+        echo "  - GATEWAY_URL=$ENV_GATEWAY_URL"
         echo ""
         print_warning "单机模式下这些配置可能导致冲突"
         if ask_yes_no "是否清除网关配置？" "N"; then
@@ -766,6 +768,13 @@ def update_env_var(content, key, value):
         new_content = content.rstrip('\n') + '\n\n' + replacement + '\n'
     return new_content
 
+
+def clear_env_var(content, key):
+    """清空已有键；键不存在时原样返回，避免 update_env_var 追加出空配置行"""
+    if re.search(r'^' + re.escape(key) + r'=', content, re.MULTILINE):
+        return update_env_var(content, key, '')
+    return content
+
 content = update_env_var(content, 'FEISHU_SEND_MODE', 'openapi')
 
 if deploy_mode == 'standalone':
@@ -773,11 +782,14 @@ if deploy_mode == 'standalone':
     content = update_env_var(content, 'FEISHU_APP_SECRET', app_secret)
     if verification_token:
         content = update_env_var(content, 'FEISHU_VERIFICATION_TOKEN', verification_token)
-    # 单机模式下清除网关配置
+    # 单机模式下清除网关配置（两个键都清，老 .env 里可能只有旧键）
     if clear_gateway:
-        content = update_env_var(content, 'FEISHU_GATEWAY_URL', '')
+        content = clear_env_var(content, 'GATEWAY_URL')
+        content = clear_env_var(content, 'FEISHU_GATEWAY_URL')
 else:
-    content = update_env_var(content, 'FEISHU_GATEWAY_URL', gateway_url)
+    content = update_env_var(content, 'GATEWAY_URL', gateway_url)
+    # 清掉旧键，避免 .env 里两个键留下不一致的值
+    content = clear_env_var(content, 'FEISHU_GATEWAY_URL')
     # 分离模式下清除飞书应用凭证
     if clear_credentials:
         content = update_env_var(content, 'FEISHU_APP_ID', '')
@@ -827,10 +839,10 @@ if [ "$DEPLOY_MODE" = "standalone" ]; then
     fi
     # 如果用户选择清除网关配置，显示清除结果
     if [ "$CLEAR_GATEWAY" = "true" ]; then
-        print_success "已清除 FEISHU_GATEWAY_URL"
+        print_success "已清除 GATEWAY_URL"
     fi
 else
-    print_success "FEISHU_GATEWAY_URL=$GATEWAY_URL"
+    print_success "GATEWAY_URL=$GATEWAY_URL"
     # 如果用户选择清除凭证，显示清除结果
     if [ "$CLEAR_CREDENTIALS" = "true" ]; then
         print_success "已清除 FEISHU_APP_ID & FEISHU_APP_SECRET & FEISHU_VERIFICATION_TOKEN"

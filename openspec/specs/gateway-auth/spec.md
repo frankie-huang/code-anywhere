@@ -440,11 +440,11 @@ Callback 后端 MUST 提供 `POST /cb/register` 接口，接收网关的 auth_to
 
 ### Requirement: Callback WebSocket 客户端
 
-Callback 后端 MUST 支持 WebSocket 隧道客户端模式（当 `FEISHU_GATEWAY_URL` 配置为 `ws://` 或 `wss://` 格式时）。
+Callback 后端 MUST 支持 WebSocket 隧道客户端模式（当 `GATEWAY_URL` 配置为 `ws://` 或 `wss://` 格式时）。
 
 #### Scenario: 启动 WS 客户端
 
-- **GIVEN** `FEISHU_GATEWAY_URL` 配置为 `ws://` 或 `wss://` 格式
+- **GIVEN** `GATEWAY_URL` 配置为 `ws://` 或 `wss://` 格式
 - **AND** 配置了 `FEISHU_OWNER_ID`
 - **WHEN** Callback 后端启动
 - **THEN** 启动 WS 客户端 daemon 线程

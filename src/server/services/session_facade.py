@@ -5,30 +5,28 @@
 
 职责：
     对 feishu.py 暴露一组语义化的 session 能力 API，内部隐藏几个子系统：
-      - 远端 callback（/cb/session/mute 等）——通过注入的 forward_fn 访问
+      - 远端 callback（/cb/session/mute 等）——通过 services/callback_client.py 访问
       - 本地 MessageSessionStore —— parent_id 反查
 
     设计上预期后续把 feishu.py 里其它 "session 相关" 的能力（group 反查、
     ensure-chat 等）陆续搬到这里。当前已纳入：
-      - resolve_from_message：根据飞书消息上下文解析归属 session
+      - resolve_from_message：按入站事件（platforms.models.IMEvent）解析归属 session
       - attach / clone / set_last_message_id / invalidate_chats：session 生命周期 RPC
       - mute / unmute：透传 callback 端的 session 级静音指令
       - mute_dir / unmute_dir：透传 callback 端的目录级静音指令
 
 mute 状态说明：
-    权威源与拦截点均在 callback 端（session_chat_store + hook 脚本的 _get_chat_id）。
+    权威源与拦截点均在 callback 端（session_chat_store + hook 脚本的 get_chat_id）。
     网关仅在用户执行 /mute、/unmute 命令时透传到 callback，不缓存、不拦截。
     自动解除静音由 callback 端 handle_continue_session 处理。
     目录级 mute 存储在 DirectoryStore，终端发起的新会话自动继承目录 mute 状态。
-
-初始化：
-    应用启动时（在 feishu.py 模块加载末尾）调用一次：
-        SessionFacade.configure(forward_fn=_forward_via_ws_or_http)
 """
 
 import logging
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
+from platforms.models import IMEvent
+from services.callback_client import forward_via_ws_or_http
 
 
 logger = logging.getLogger(__name__)
@@ -59,27 +57,6 @@ class SessionFacade:
             """是否无法从消息上下文定位到任何 session（非回复、非 group 群聊等）"""
             return source == cls.UNRESOLVED
 
-
-    # ---- 注入的下游依赖（feishu.py 启动时 configure 一次）----
-    _forward_fn: Optional[Callable[..., Optional[Dict[str, Any]]]] = None
-
-    # =========================================================================
-    # 初始化
-    # =========================================================================
-
-    @classmethod
-    def configure(
-        cls,
-        forward_fn: Callable[..., Optional[Dict[str, Any]]],
-    ) -> None:
-        """注入 gateway → callback 的转发函数
-
-        Args:
-            forward_fn: (binding, endpoint, payload) -> resp dict
-                实际传入 feishu._forward_via_ws_or_http
-        """
-        cls._forward_fn = forward_fn
-        logger.debug("[session-facade] configured")
 
     # =========================================================================
     # Session 路由
@@ -132,10 +109,10 @@ class SessionFacade:
             {'project_dir': str, 'command': str, 'agent_type': str, 'chat_id': str, 'dissolved': bool}
             失败或 session 不存在返回空 dict（所有字段为空的等价）
         """
-        if not session_id or cls._forward_fn is None:
+        if not session_id:
             return {}
         try:
-            resp = cls._forward_fn(binding, '/cb/session/get-info',
+            resp = forward_via_ws_or_http(binding, '/cb/session/get-info',
                                    {'session_id': session_id})
         except Exception as e:
             logger.warning("[session-facade] fetch_session_info error: %s", e)
@@ -151,8 +128,9 @@ class SessionFacade:
         }
 
     @classmethod
-    def resolve_from_message(cls, data: dict, binding: Dict[str, Any]) -> Dict[str, str]:
-        """按飞书消息上下文解析该消息归属的 session
+    def resolve_from_message(cls, binding: Dict[str, Any],
+                             event: IMEvent) -> Dict[str, str]:
+        """按消息事件解析该消息归属的 session
 
         优先级：
         1. 有 parent_id：通过 MessageSessionStore 反查 parent 消息所属 session
@@ -166,6 +144,10 @@ class SessionFacade:
           UNRESOLVED 给"无法确定目标"
         - 被动钩子（auto_unmute 等）：PARENT_NOT_FOUND / UNRESOLVED 均静默跳过
 
+        Args:
+            binding: 绑定信息（group 模式反查需要）
+            event: 入站消息事件（路由所需字段直接从事件属性读取）
+
         Returns:
             {
                 'source':      SessionFacade.RouteSource.*  (str 字面量),
@@ -175,11 +157,9 @@ class SessionFacade:
         """
         from stores.message_session_store import MessageSessionStore
 
-        event = data.get('event', {})
-        message = event.get('message', {})
-        chat_id = message.get('chat_id', '')
-        parent_id = message.get('parent_id', '')
-        chat_type = message.get('chat_type', '')
+        parent_id = event.parent_id
+        chat_id = event.chat_id
+        chat_type = event.chat_type
         session_mode = binding.get('session_mode', '')
 
         empty = {'session_id': '', 'project_dir': ''}
@@ -233,10 +213,8 @@ class SessionFacade:
             callback 响应 dict（含 matched_ids, attached, session_id 等），
             失败返回 None
         """
-        if cls._forward_fn is None:
-            return None
         try:
-            return cls._forward_fn(binding, '/cb/session/attach', {
+            return forward_via_ws_or_http(binding, '/cb/session/attach', {
                 'session_prefix': session_prefix,
                 'chat_id': chat_id,
             })
@@ -258,10 +236,8 @@ class SessionFacade:
         Returns:
             callback 响应 dict（含 ok, project_dir），失败返回 None
         """
-        if cls._forward_fn is None:
-            return None
         try:
-            return cls._forward_fn(binding, '/cb/session/clone', {
+            return forward_via_ws_or_http(binding, '/cb/session/clone', {
                 'old_session_id': old_session_id,
                 'new_session_id': new_session_id,
                 'chat_id': chat_id,
@@ -283,10 +259,10 @@ class SessionFacade:
         Returns:
             是否设置成功
         """
-        if not session_id or not message_id or cls._forward_fn is None:
+        if not session_id or not message_id:
             return False
         try:
-            resp = cls._forward_fn(binding, '/cb/session/set-last-message-id', {
+            resp = forward_via_ws_or_http(binding, '/cb/session/set-last-message-id', {
                 'session_id': session_id,
                 'message_id': message_id,
             })
@@ -318,10 +294,8 @@ class SessionFacade:
         Returns:
             callback 响应 dict（含 ok），失败返回 None
         """
-        if cls._forward_fn is None:
-            return None
         try:
-            resp = cls._forward_fn(binding, '/cb/session/invalidate-chats', {
+            resp = forward_via_ws_or_http(binding, '/cb/session/invalidate-chats', {
                 'chat_ids': chat_ids,
             })
             if not resp or not resp.get('ok'):
@@ -435,14 +409,11 @@ class SessionFacade:
     def _call_session_mute_api(cls, binding: Dict[str, Any], action: str,
                                session_id: str = '') -> Optional[Dict[str, Any]]:
         """调 /cb/session/mute；action ∈ {mute, unmute, query, list}。失败返回 None。"""
-        if cls._forward_fn is None:
-            logger.error("[session-facade] forward_fn not configured")
-            return None
         try:
             payload = {'action': action}
             if session_id:
                 payload['session_id'] = session_id
-            resp = cls._forward_fn(binding, '/cb/session/mute', payload)
+            resp = forward_via_ws_or_http(binding, '/cb/session/mute', payload)
             if resp and resp.get('ok'):
                 return resp
             logger.warning("[session-facade] /cb/session/mute (%s) failed: %s", action, resp)
@@ -456,16 +427,13 @@ class SessionFacade:
                            project_dir: str = '',
                            recursive: bool = False) -> Optional[Dict[str, Any]]:
         """调 /cb/directory/mute；action ∈ {mute, unmute, query, list}。失败返回 None。"""
-        if cls._forward_fn is None:
-            logger.error("[session-facade] forward_fn not configured")
-            return None
         try:
             payload = {'action': action}
             if project_dir:
                 payload['project_dir'] = project_dir
             if recursive:
                 payload['recursive'] = True
-            resp = cls._forward_fn(binding, '/cb/directory/mute', payload)
+            resp = forward_via_ws_or_http(binding, '/cb/directory/mute', payload)
             if resp and resp.get('ok'):
                 return resp
             logger.warning("[session-facade] /cb/directory/mute (%s) failed: %s", action, resp)

@@ -8,7 +8,6 @@ Feishu Handler - 飞书事件处理器
     - 发送消息（/gw/feishu/send）
 
 WebSocket 隧道支持：
-    - _forward_via_ws_or_http(): 优先通过 WS 隧道转发请求，失败时 fallback 到 HTTP
     - 适用于 Callback 后端不可公网访问的场景（本地开发、内网部署）
 """
 
@@ -18,6 +17,8 @@ import logging
 import uuid
 from typing import Dict, List, Tuple
 
+from platforms import get_im_adapter
+from platforms.models import IMEvent, IMEventKind
 from utils.concurrency import run_in_background
 from services.session_facade import SessionFacade
 
@@ -26,12 +27,10 @@ from .utils import (
     _COLLABORATOR_ALLOWED_COMMANDS, _SESSION_NOT_FOUND_HINT,
     _sanitize_user_content, _log_message_event,
     _is_multi_person_group, _get_gateway_ws_url,
-    _get_binding_from_event, _find_cowork_owner,
+    find_binding, _find_cowork_owner,
 )
-from .content import build_mention_resolution, extract_message_text
 from .message import _send_notice_message, _send_help_card
 from .forward import (
-    _forward_via_ws_or_http,
     _forward_continue_request, _forward_new_request,
     _forward_new_request_for_default_dir,
 )
@@ -40,7 +39,7 @@ from .command import (
     _handle_new_command, _handle_reply_command,
     _handle_groups_command, _handle_attach_command,
     _handle_clear_command, _handle_stop_command,
-    _handle_users_command,
+    _handle_copy_command, _handle_users_command,
 )
 from .mute import _handle_mute_command, _handle_unmute_command
 from .notify import _handle_notify_command
@@ -50,16 +49,14 @@ from .notify import _handle_notify_command
 from .group import (  # noqa: F401
     handle_add_reaction, handle_create_group,
     handle_remove_reaction, handle_send_message,
-    batch_dissolve_groups, create_group_chat_and_record,
-    find_idle_group_chats, handle_card_action_register,
+    create_group_chat_and_record, handle_card_action_register,
 )
 
 __all__ = [
     'handle_feishu_request',
     'handle_add_reaction', 'handle_create_group',
     'handle_remove_reaction', 'handle_send_message',
-    'batch_dissolve_groups', 'create_group_chat_and_record',
-    'find_idle_group_chats', 'handle_card_action_register',
+    'create_group_chat_and_record', 'handle_card_action_register',
 ]
 
 logger = logging.getLogger(__name__)
@@ -80,8 +77,11 @@ def handle_feishu_request(data: dict, skip_token_validation: bool = False) -> Tu
     Returns:
         (handled, response): handled 表示是否处理了请求，response 是响应数据
     """
+    # 事件解析交给平台适配层：类型判定与字段提取都在 parse_event 内完成
+    event = get_im_adapter().parse_event(data)
+
     # URL 验证请求（优先处理，无需验证 token）
-    if data.get('type') == 'url_verification':
+    if event and event.kind == IMEventKind.VERIFICATION:
         return _handle_url_verification(data)
 
     # 验证 Verification Token（HTTP 回调模式需要，长连接模式跳过）
@@ -89,17 +89,13 @@ def handle_feishu_request(data: dict, skip_token_validation: bool = False) -> Tu
         logger.warning("[feishu] Invalid verification token")
         return False, {'success': False, 'error': 'Invalid verification token'}
 
-    # 事件订阅（schema 2.0）
-    header = data.get('header', {})
-    event_type = header.get('event_type', '')
-
-    if event_type == 'im.message.receive_v1':
-        _handle_message_event(data)
+    if event and event.kind == IMEventKind.MESSAGE:
+        _handle_message_event(event)
         return True, {'success': True}
 
     # 卡片回传交互事件
-    if event_type == 'card.action.trigger':
-        return _handle_card_action(data)
+    if event and event.kind == IMEventKind.CARD_ACTION:
+        return _handle_card_action(event)
 
     # 未处理的飞书事件类型或其他请求
     event_type = data.get('header', {}).get('event_type', '')
@@ -158,45 +154,28 @@ def _handle_url_verification(data: dict) -> Tuple[bool, dict]:
     return True, {'challenge': challenge}
 
 
-def _handle_message_event(data: dict):
-    """处理飞书消息事件 im.message.receive_v1
+def _handle_message_event(event: IMEvent):
+    """处理消息事件（字段已由 IMAdapter.parse_event 解析）
 
     Args:
-        data: 飞书事件数据
+        event: 平台无关的入站事件
     """
-    event = data.get('event', {})
-    message = event.get('message', {})
-    sender = event.get('sender', {})
-    sender_id_obj = sender.get('sender_id', {})
-
-    message_id = message.get('message_id', '')
-    chat_id = message.get('chat_id', '')
-    chat_type = message.get('chat_type', '')  # p2p / group
-    message_type = message.get('message_type', '')  # text / image / ...
-    sender_id = sender_id_obj.get('open_id', '')
-    user_id = sender_id_obj.get('user_id', sender_id)
-    parent_id = message.get('parent_id', '')  # 是否是回复消息
-
-    # 构建 @提及 替换表（bot→删除，人员→@name(user_id)）并判断是否 @bot
-    mention_resolution, is_at_bot = build_mention_resolution(message.get('mentions'))
-
-    # 解析消息纯文本内容（@ 占位符在解析过程中按 resolution 表替换）
-    text = extract_message_text(message_type, message.get('content', '{}'), mention_resolution)
+    message_id = event.message_id
+    chat_id = event.chat_id
+    chat_type = event.chat_type  # p2p / group
+    user_id = event.sender_user_id
+    parent_id = event.parent_id  # 是否是回复消息
+    text = event.text
+    is_at_bot = event.is_at_bot
 
     # 先记录原始数据到日志（所有消息都记录），脱敏用户内容
-    _log_message_event(data, text)
+    _log_message_event(event)
 
-    logger.info(f"[feishu] Message received: chat_type={chat_type}, message_type={message_type}, parent_id={parent_id if parent_id else ''}, text={_sanitize_user_content(text)}")
-
-    # 将解析后的纯文本写入 message['plain_text']，供下游直接使用
-    message['plain_text'] = text
-
-    # @bot 状态写入 message，供下游（多人群过滤等）使用
-    message['is_at_bot'] = is_at_bot
-    logger.debug(f"[feishu] is_at_bot={is_at_bot}, mentions_count={len(message.get('mentions', []))}")
+    logger.info(f"[feishu] Message received: chat_type={chat_type}, message_type={event.message_type}, parent_id={parent_id if parent_id else ''}, text={_sanitize_user_content(text)}")
+    logger.debug(f"[feishu] is_at_bot={is_at_bot}")
 
     # 获取用户绑定信息（后续处理统一使用）
-    binding = _get_binding_from_event(event)
+    binding = find_binding(event.sender_id_values, 'sender_id')
 
     # 协作者模式前置检测：群聊 + 无 binding 或群内无自己 session + owner 开启 cowork
     # 原始 binding 保存到 _original_binding，供 _handle_command 非白名单命令时恢复
@@ -219,13 +198,12 @@ def _handle_message_event(data: dict):
             binding = dict(owner_binding)
             binding['_collaborator_user_id'] = user_id
             binding['_original_binding'] = original_binding
-            event['_effective_binding'] = binding
 
     # 未注册且非协作者：提示注册
     # - 单聊始终提示；群聊仅 @bot 时提示
     if not binding:
         is_p2p = (chat_type == 'p2p')
-        should_respond = is_p2p or message.get('is_at_bot', False)
+        should_respond = is_p2p or is_at_bot
         if should_respond:
             gateway_ws_url = _get_gateway_ws_url()
             hint = "您（用户 ID：`%s`）尚未注册，无法使用此功能。" % user_id
@@ -238,7 +216,7 @@ def _handle_message_event(data: dict):
         return
 
     # group 模式下多人群需要 @bot，单人群（owner + bot）不需要
-    if chat_type == 'group' and not message.get('is_at_bot', False):
+    if chat_type == 'group' and not is_at_bot:
         if binding.get('session_mode') == 'group' and _is_multi_person_group(chat_id):
             logger.debug("[feishu] Ignored non-@bot message in multi-person group: chat=%s msg=%s",
                          chat_id, message_id)
@@ -249,7 +227,7 @@ def _handle_message_event(data: dict):
     is_command, command, args = _parse_command(text)
     is_slash_cmd = is_command and command in _get_slash_commands()
     if is_command and not is_slash_cmd:
-        _handle_command(data, command, args)
+        _handle_command(event, command, args, binding)
         return
 
     # 非命令消息：空内容早退（图片/贴图/非文字消息等均 text 为空）
@@ -260,7 +238,7 @@ def _handle_message_event(data: dict):
         return
 
     # 路由到已有 session：优先 parent_id，其次 group 模式群聊 chat_id 反查
-    route_info = SessionFacade.resolve_from_message(data, binding)
+    route_info = SessionFacade.resolve_from_message(binding, event)
     route_source = route_info['source']
 
     if SessionFacade.RouteSource.is_parent_not_found(route_source):
@@ -324,7 +302,7 @@ def _handle_message_event(data: dict):
     default_chat_dir = binding.get('default_chat_dir', '')
     # 配置了默认聊天目录时，自动创建/继续会话
     if default_chat_dir:
-        _handle_default_chat_message(data, prompt, binding)
+        _handle_default_chat_message(event, prompt, binding)
         return
 
     # 已注册但未配置默认目录：发送帮助卡片
@@ -337,8 +315,6 @@ def _handle_message_event(data: dict):
            "在 `.env` 中配置 `DEFAULT_CHAT_DIR` 并重启服务，即可直接发消息对话"
     run_in_background(_send_help_card, (binding, chat_id, message_id,
                                         _COMMANDS, _slash_commands_as_help_dict(), hint))
-
-
 
 
 def _parse_command(text: str) -> Tuple[bool, str, str]:
@@ -371,22 +347,19 @@ def _parse_command(text: str) -> Tuple[bool, str, str]:
     return True, command, args
 
 
-def _handle_command(data: dict, command: str, args: str):
+def _handle_command(event: IMEvent, command: str, args: str, binding: dict):
     """处理命令
 
     Args:
-        data: 飞书事件数据
+        event: 入站事件
         command: 命令名（如 'new'）
         args: 参数部分
+        binding: 生效的绑定信息（协作者场景下已由 _handle_message_event 替换为 owner 的）
     """
     from config import FEISHU_OWNER_ID as gateway_owner_id
 
-    # 统一获取事件信息（协作者场景下 _effective_binding 已由 _handle_message_event 前置注入）
-    event = data.get('event', {})
-    message = event.get('message', {})
-    chat_id = message.get('chat_id', '')
-    message_id = message.get('message_id', '')
-    binding = _get_binding_from_event(event)
+    chat_id = event.chat_id
+    message_id = event.message_id
     if not binding:
         return
 
@@ -402,7 +375,6 @@ def _handle_command(data: dict, command: str, args: str):
                 # 已注册用户：恢复自己的 binding，以自己的身份执行命令
                 binding = original_binding
                 owner_id = binding.get('_owner_id', '')
-                event.pop('_effective_binding', None)
             else:
                 # 未注册用户：无自己的 binding，拒绝
                 run_in_background(_send_notice_message,
@@ -417,7 +389,7 @@ def _handle_command(data: dict, command: str, args: str):
             if chat_id:
                 run_in_background(_send_notice_message, (chat_id, "此指令仅限管理员使用", message_id))
             return
-        handler_func(data, args)
+        handler_func(event, args, binding)
     else:
         logger.info(f"[feishu] Unknown command: /{command}")
         if chat_id:
@@ -426,7 +398,7 @@ def _handle_command(data: dict, command: str, args: str):
                                 _COMMANDS, _slash_commands_as_help_dict(), f"未知指令：`/{command}`"))
 
 
-def _handle_default_chat_message(data: dict, prompt: str, binding: dict) -> None:
+def _handle_default_chat_message(event: IMEvent, prompt: str, binding: dict) -> None:
     """处理默认聊天目录下的普通消息
 
     当用户的 binding 中配置了 default_chat_dir 时，普通消息（非指令、非回复）会：
@@ -434,16 +406,14 @@ def _handle_default_chat_message(data: dict, prompt: str, binding: dict) -> None
     - 无活跃默认会话 → 在默认目录创建新会话
 
     Args:
-        data: 飞书事件数据
+        event: 入站事件
         prompt: 用户消息内容（已清理）
         binding: 用户绑定信息（包含 default_chat_dir）
     """
-    event = data.get('event', {})
-    message = event.get('message', {})
-    chat_id = message.get('chat_id', '')
-    chat_type = message.get('chat_type', '')
-    message_id = message.get('message_id', '')
-    sender_id = event.get('sender', {}).get('sender_id', {}).get('user_id', '')
+    chat_id = event.chat_id
+    chat_type = event.chat_type
+    message_id = event.message_id
+    sender_id = event.sender_user_id
 
     default_chat_dir = binding.get('default_chat_dir', '')
     session_id = binding.get('default_chat_session_id', '')
@@ -466,14 +436,9 @@ def _handle_default_chat_message(data: dict, prompt: str, binding: dict) -> None
         ))
 
 
-def _handle_help_command(data: dict, args: str) -> None:
+def _handle_help_command(event: IMEvent, args: str, binding: dict) -> None:
     """处理 /help 命令：展示指令帮助卡片"""
-    event = data.get('event', {})
-    message = event.get('message', {})
-    chat_id = message.get('chat_id', '')
-    message_id = message.get('message_id', '')
-    binding = _get_binding_from_event(event)
-    run_in_background(_send_help_card, (binding, chat_id, message_id,
+    run_in_background(_send_help_card, (binding, event.chat_id, event.message_id,
                                          _COMMANDS, _slash_commands_as_help_dict()))
 
 
@@ -525,6 +490,9 @@ _COMMANDS = {
     ]),
     'stop': (_handle_stop_command, False, "停止当前执行中的 Agent 任务", [
         ("/stop", "停止当前正在执行的 Agent 任务并清空排队指令"),
+    ]),
+    'copy': (_handle_copy_command, False, "复制会话最后答复", [
+        ("/copy", "将当前会话的最后一条答复以 markdown 代码块发送，便于复制原文"),
     ]),
     'notify': (_handle_notify_command, False, "管理通知配置", [
         ("/notify status", "查看当前通知配置"),
@@ -597,7 +565,3 @@ def _slash_commands_as_help_dict():
     """
     _get_slash_commands()  # 确保缓存已构建
     return _slash_help_cache
-
-
-# 模块加载末尾：注入 SessionFacade 的下游依赖（避免 services -> handlers 循环 import）
-SessionFacade.configure(forward_fn=_forward_via_ws_or_http)

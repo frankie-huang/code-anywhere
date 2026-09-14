@@ -72,17 +72,17 @@
 
 ### Decision 3.5: 默认中心网关地址与模式检测
 
-**选择**: `FEISHU_SEND_MODE=openapi` 时，`FEISHU_GATEWAY_URL` 默认指向中心网关。通过特殊值 `local` 声明 standalone 模式。
+**选择**: `FEISHU_SEND_MODE=openapi` 时，`GATEWAY_URL` 默认指向中心网关。通过特殊值 `local` 声明 standalone 模式。
 
 **模式检测规则**（仅 `FEISHU_SEND_MODE=openapi` 时适用）:
 
-| FEISHU_GATEWAY_URL | 行为 |
+| GATEWAY_URL | 行为 |
 |---------------------|------|
 | 未设置 | **默认连中心网关**（不管有没有 APP_SECRET） |
 | 自定义地址（`ws://`/`wss://`/`http://`） | **连指定网关** |
 | `local` | **standalone 本地模式**（网关 + callback 同进程） |
 
-**Breaking Change**: 现有 standalone 用户（`SEND_MODE=openapi` + 完整凭据，无 GATEWAY_URL）升级后需要新增一行 `FEISHU_GATEWAY_URL=local`，否则会默认连中心网关。
+**Breaking Change**: 现有 standalone 用户（`SEND_MODE=openapi` + 完整凭据，无 GATEWAY_URL）升级后需要新增一行 `GATEWAY_URL=local`，否则会默认连中心网关。
 
 **原因**:
 - 逻辑统一无歧义：不再需要根据凭据完整度猜测用户意图

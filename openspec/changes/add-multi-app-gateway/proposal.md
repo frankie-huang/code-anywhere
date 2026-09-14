@@ -23,8 +23,8 @@
 ## What Changes
 
 - **中心网关模式**: 网关支持以中心化模式启动，接受多个飞书应用的动态注册
-- **默认网关地址**: `FEISHU_SEND_MODE=openapi` 时，`FEISHU_GATEWAY_URL` 默认指向中心网关，无需手动配置；自建网关用户可覆盖为自定义地址
-- **Standalone 显式声明**: `FEISHU_GATEWAY_URL=local` 表示 standalone 本地模式（**Breaking Change**: 现有 standalone 用户升级后需新增此配置）
+- **默认网关地址**: `FEISHU_SEND_MODE=openapi` 时，`GATEWAY_URL` 默认指向中心网关，无需手动配置；自建网关用户可覆盖为自定义地址
+- **Standalone 显式声明**: `GATEWAY_URL=local` 表示 standalone 本地模式（**Breaking Change**: 现有 standalone 用户升级后需新增此配置）
 - **多应用 Longpoll 管理**: 网关为每个注册的飞书应用维护独立的 longpoll 长连接，接收并解密事件
 - **两阶段注册**: Callback 先尝试 app_id + owner_id 注册；若 app 未注册且配置了 app_secret，自动重试携带凭据完成应用首次注册
 - **事件路由**: 网关通过 longpoll 接收事件（SDK 自动解密），按 (app_id, sender_id) 路由到对应 Callback

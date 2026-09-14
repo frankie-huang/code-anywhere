@@ -54,14 +54,14 @@ Agent 触发 Hook 事件 → src/hook-router.sh（统一入口）
   └─ Stop             → src/hooks/stop.sh          （任务完成通知）
 ```
 
-共享库在 `src/lib/`：`core.sh`（路径/配置/日志）、`json.sh`（JSON 解析，jq>python3>grep 降级）、`feishu.sh`（卡片构建与发送）、`socket.sh`（Unix Socket 通信，4 字节长度前缀协议）、`tool.sh`/`tool-config.sh`（工具详情格式化）、`vscode-proxy.sh`（VSCode SSH 代理）。
+共享库在 `src/lib/`：`core.sh`（路径/配置/日志）、`json.sh`（JSON 解析，jq>python3>grep 降级）、`feishu.sh`（卡片构建与发送）、`socket.sh`（Unix Socket 通信，4 字节长度前缀协议）、`tool.sh`/`tool-config.sh`（工具详情格式化）、`transcript.sh`（transcript 答复提取，支持 CLI 直调）、`vscode-proxy.sh`（VSCode SSH 代理）。
 
 ### Python Server 层（回调服务）
 
 `src/server/main.py` 启动 HTTP + Unix Socket 双协议服务器（ThreadedHTTPServer）。
 
 **路由结构**（`handlers/http_handler.py` 分发）：
-- `/gw/*` — 网关侧接口（注册、消息发送、群聊创建）
+- `/gw/*` — 网关侧接口（注册平台无关；平台端点由 `adapter.gateway_routes()` 声明，路由层统一 owner 鉴权）
 - `/cb/*` — 回调侧接口（决策下发、会话管理、Agent 启动/继续）
 - GET `/allow|always|deny|interrupt` — 权限决策回调
 - GET `/ws/tunnel` — WebSocket 隧道入口
@@ -70,6 +70,9 @@ Agent 触发 Hook 事件 → src/hook-router.sh（统一入口）
 - `request_manager.py` — 待处理权限请求注册表（request_id → socket 连接）
 - `feishu_api.py` — 飞书 API 封装（token 管理、消息发送、敏感信息脱敏）
 - `session_facade.py` — 会话操作网关
+- `callback_client.py` — 网关→Callback 传输（WS 隧道/HTTP 双通道 + 注册通知）
+- `gateway_client.py` — Callback→网关 传输
+- `group_maintenance.py` — 群聊维护编排（空闲群发现、批量解散，平台无关）
 - `ws_tunnel_client.py` — WS 隧道客户端（callback 主动连网关）
 
 **核心存储**（`stores/` 下单例，统一继承 `JsonStore` 基类）：
@@ -78,6 +81,10 @@ Agent 触发 Hook 事件 → src/hook-router.sh（统一入口）
 ### Agent 适配层（策略模式）
 
 `src/server/agents/__init__.py` 定义 `AgentAdapter` 基类，`agents/claude.py` 和 `agents/codex.py` 分别实现。通过 `get_agent_adapter(agent_type)` 工厂获取实例。适配器负责构建命令行、解析斜杠命令、处理权限持久化差异。
+
+### IM 平台适配层（策略模式）
+
+`src/server/platforms/base.py` 定义 `IMAdapter` 基类（生命周期、出站 `cb_*`、注册授权、入站事件解析 `parse_event`、网关端点声明 `gateway_routes`）与 `GroupCapable` 群聊能力混入，`feishu_adapter.py` 实现飞书。业务层通过 `platforms/__init__.py` 的 `get_im_adapter()` 工厂获取实例（按 `IM_PLATFORM` 配置，默认 feishu）。入站事件统一解析为 `platforms/models.py` 的 `IMEvent` 中立结构，业务层不接触平台原始报文；路由层（http_handler）的平台端点与事件兜底也经 adapter 声明。新增平台：实现 adapter + 工厂注册一行，业务层零改动。
 
 ### 飞书卡片模板系统
 
@@ -102,7 +109,7 @@ Agent 触发 Hook 事件 → src/hook-router.sh（统一入口）
 
 ```
 1. 用户在飞书回复完成通知消息
-2. im.message.receive_v1 事件 → feishu 包 → MessageSessionStore 查找 session_id
+2. im.message.receive_v1 事件 → adapter.parse_event 解析为 IMEvent → MessageSessionStore 查找 session_id
 3. 路由到 agent.py → 使用 AgentAdapter 构建 `claude --resume SESSION_ID` 命令
 4. 后台监控 Agent 完成 → 发送新的完成通知
 ```
@@ -253,12 +260,13 @@ def foo(name: str, count: int = 0) -> bool:  # 内联注解
 
 **判断标准**：如果不同用户可能需要不同的值，就是 per-user 配置。
 
-per-user 配置的完整链路（以 `group_allow_cowork` 为例），新增只需改 3 处：
+per-user 配置的完整链路（以 `group_allow_cowork` 为例），新增只需改 4 处：
 1. `register.py:extract_binding_params()` — 从请求数据中提取字段（唯一入口）
 2. `binding_store.py:upsert()` — 存储到 binding
-3. `config.py` — 定义全局默认值（callback 端注册时使用）
+3. `config.py` — 定义全局默认值
+4. `<platform>_adapter.py:default_binding_params()` — 把默认值暴露给注册组装
 
-注册时 `main.py` / `auto_register.py` 组装 `binding_params` dict 传给网关，网关侧 `register.py` 和 `ws_handler.py` 通过 `extract_binding_params()` 统一提取，`binding_store.upsert()` 统一存储。读取时 `feishu` 包从 `binding.get('xxx')` 读取（而非全局 config）。
+注册时 callback 侧统一经 `auto_register.py:build_binding_params()` 组装 `binding_params` dict（WS 隧道与 HTTP 注册两条路径共用，平台默认值来自 adapter，Agent 命令表等平台无关键在内合并）传给网关，网关侧 `register.py` 和 `ws_handler.py` 通过 `extract_binding_params()` 统一提取，`binding_store.upsert()` 统一存储。读取时 `feishu` 包从 `binding.get('xxx')` 读取（而非全局 config）。
 
 ### 网关侧接口鉴权
 

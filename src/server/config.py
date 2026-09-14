@@ -324,30 +324,34 @@ if FEISHU_OWNER_ID:
             f"请在飞书开放平台获取用户的 user_id（纯数字或字母数字组合）。"
         )
 
-# 飞书网关地址（分离部署时配置）
+# 网关地址（分离部署时配置）
 # 支持 http(s):// 和 ws(s):// 两种格式：
 #   - ws:// / wss:// → WS 隧道模式（callback 不需要公网可达）
 #   - http:// / https:// → HTTP 回调模式（callback 需要公网可达）
-# FEISHU_GATEWAY_URL 统一为 HTTP base URL，供 API 调用使用
-_FEISHU_GATEWAY_URL_RAW = get_config('FEISHU_GATEWAY_URL', '')
+# GATEWAY_URL 统一为 HTTP base URL，供 API 调用使用；连接方式看 GATEWAY_MODE
+#
+# 键名：网关地址由部署拓扑决定，与 IM 平台无关，故键名为 GATEWAY_URL；
+# 旧键 FEISHU_GATEWAY_URL 继续生效（两者都配时 GATEWAY_URL 优先）。
+# Shell 侧 lib/callback.sh 的 get_gateway_url() 采用同一优先级。
+_GATEWAY_URL_RAW = get_config('GATEWAY_URL', '') or get_config('FEISHU_GATEWAY_URL', '')
 
-if _FEISHU_GATEWAY_URL_RAW:
-    # 有配置 FEISHU_GATEWAY_URL
-    _host_part = _FEISHU_GATEWAY_URL_RAW.split('://', 1)[1].split('/')[0]
-    if _FEISHU_GATEWAY_URL_RAW.startswith(('ws://', 'wss://')):
-        FEISHU_GATEWAY_MODE = 'ws'
-        _scheme = 'https' if _FEISHU_GATEWAY_URL_RAW.startswith('wss://') else 'http'
-        FEISHU_GATEWAY_URL = f'{_scheme}://{_host_part}'
+if _GATEWAY_URL_RAW:
+    # 显式配置了网关地址
+    _host_part = _GATEWAY_URL_RAW.split('://', 1)[1].split('/')[0]
+    if _GATEWAY_URL_RAW.startswith(('ws://', 'wss://')):
+        GATEWAY_MODE = 'ws'
+        _scheme = 'https' if _GATEWAY_URL_RAW.startswith('wss://') else 'http'
+        GATEWAY_URL = f'{_scheme}://{_host_part}'
     else:
-        FEISHU_GATEWAY_MODE = 'http'
-        FEISHU_GATEWAY_URL = _FEISHU_GATEWAY_URL_RAW.rstrip('/')
+        GATEWAY_MODE = 'http'
+        GATEWAY_URL = _GATEWAY_URL_RAW.rstrip('/')
 elif FEISHU_SEND_MODE == 'openapi':
     # 单机模式：默认使用 WS 隧道连接本地网关（架构统一，与分离部署行为一致）
-    FEISHU_GATEWAY_MODE = 'ws'
-    FEISHU_GATEWAY_URL = CALLBACK_SERVER_URL
+    GATEWAY_MODE = 'ws'
+    GATEWAY_URL = CALLBACK_SERVER_URL
 else:
-    FEISHU_GATEWAY_MODE = ''
-    FEISHU_GATEWAY_URL = ''
+    GATEWAY_MODE = ''
+    GATEWAY_URL = ''
 
 # =============================================================================
 # OpenAPI 模式下的服务模式判断与冲突检测
@@ -356,18 +360,18 @@ IS_CALLBACK_BACKEND = False  # 默认值，webhook 模式或未配置
 
 if FEISHU_SEND_MODE == 'openapi':
     # 冲突检测：APP 凭据和网关地址不能同时配置
-    if _FEISHU_GATEWAY_URL_RAW and FEISHU_APP_ID and FEISHU_APP_SECRET:
+    if _GATEWAY_URL_RAW and FEISHU_APP_ID and FEISHU_APP_SECRET:
         raise ValueError(
-            "配置冲突: FEISHU_APP_ID/FEISHU_APP_SECRET 与 FEISHU_GATEWAY_URL 不能同时配置。\n"
+            "配置冲突: FEISHU_APP_ID/FEISHU_APP_SECRET 与 GATEWAY_URL 不能同时配置。\n"
             "  - 单机部署：只需配置 FEISHU_APP_ID + FEISHU_APP_SECRET\n"
-            "  - 分离部署：只需配置 FEISHU_GATEWAY_URL（凭据由网关管理）\n"
+            "  - 分离部署：只需配置 GATEWAY_URL（凭据由网关管理）\n"
             "请移除其中一组配置。"
         )
 
-    # 是否为分离部署的 Callback 后端（显式配置了 FEISHU_GATEWAY_URL）
+    # 是否为分离部署的 Callback 后端（显式配置了网关地址）
     # - 单机部署（False）：同时充当网关 + Callback 后端，网关地址自动指向本地
     # - 分离部署（True）：纯 Callback 后端，连接远程网关
-    IS_CALLBACK_BACKEND = bool(_FEISHU_GATEWAY_URL_RAW)
+    IS_CALLBACK_BACKEND = bool(_GATEWAY_URL_RAW)
 
 # 飞书事件接收模式: auto / http / longpoll
 # - auto: 自动检测（默认）- 有 lark-oapi 则 longpoll，否则 http

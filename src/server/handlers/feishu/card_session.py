@@ -11,7 +11,6 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from .utils import (
-    _get_binding_from_event,
     _build_agent_commands_from_binding,
     _merge_agent_commands,
 )
@@ -513,7 +512,7 @@ def _build_new_session_card(
 
 def _build_browse_result_card(browse_data: dict, form_values: dict, custom_dir_value: str,
                               chat_id: str, message_id: str, chat_type: str,
-                              feishu_event: dict) -> dict:
+                              binding: Optional[dict]) -> dict:
     """构建包含浏览结果的目录选择卡片
 
     Args:
@@ -523,13 +522,11 @@ def _build_browse_result_card(browse_data: dict, form_values: dict, custom_dir_v
         chat_id: 群聊 ID
         message_id: 原始消息 ID
         chat_type: 聊天类型（group/p2p），透传到卡片
-        feishu_event: 飞书事件数据
+        binding: 提交者的绑定信息
 
     Returns:
         飞书卡片字典
     """
-    # 获取绑定信息
-    binding = _get_binding_from_event(feishu_event)
     owner_id = binding.get('_owner_id', '') if binding else ''
 
     # 获取常用目录列表

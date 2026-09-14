@@ -83,7 +83,7 @@
 {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
 ```
 
-**文件**：`stop.sh` `extract_codex_response()` / `extract_claude_response()`
+**文件**：`src/lib/transcript.sh`（原 stop.sh，2026-09-13 抽出为共享库）`extract_codex_response()` / `extract_claude_response()`
 
 ### 提取差异
 

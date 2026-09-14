@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-Agent Permission Callback Server
+Agent Callback Server
 
 功能：
-    HTTP 服务接收飞书卡片按钮的 URL 跳转请求，
-    通过 Unix Domain Socket 将用户决策传递给 hooks/permission-notify.sh
+    为 Agent Hook 与 IM 平台之间提供回调服务：权限审批决策回传、会话管理、
+    Agent 启停、目录与通知配置等（路由见 handlers/http_handler.py）
 
-架构：
-    1. hooks/permission-notify.sh 发送飞书交互卡片（带按钮）
-    2. 用户点击飞书按钮，浏览器访问回调服务器 HTTP 端点
-    3. 回调服务器接收 HTTP 请求，通过 Unix Socket 返回决策
-    4. hooks/permission-notify.sh 接收决策并返回给触发 hook 的 Agent
+权限审批流程（Unix Socket 部分）：
+    1. hooks/permission.sh 发送交互卡片（带按钮），并通过 Socket 注册请求
+    2. 用户在 IM 侧点击按钮，回调到本服务的 HTTP 端点
+    3. 本服务通过 Socket 把决策回传给等待中的 hook
+    4. hooks/permission.sh 将决策返回给触发 hook 的 Agent
 
 WebSocket 隧道模式：
-    当 FEISHU_GATEWAY_URL 配置为 ws:// 或 wss:// 时启用。
+    当 GATEWAY_URL 配置为 ws:// 或 wss:// 时启用。
     Callback 后端主动连接网关建立 WS 隧道，无需公网可达。
     适用于本地开发环境或内网部署场景。
 
@@ -25,6 +25,7 @@ import http.server
 import json
 import logging
 import os
+import signal
 import socket
 import socketserver
 import sys
@@ -40,13 +41,12 @@ from config import (
     PERMISSION_REQUEST_TIMEOUT, DEFAULT_PERMISSION_REQUEST_TIMEOUT,
     get_config, get_config_positive_int,
     DEFAULT_SOCKET_PATH, DEFAULT_HTTP_PORT,
-    FEISHU_APP_ID, FEISHU_APP_SECRET, FEISHU_SEND_MODE,
-    CALLBACK_SERVER_URL, FEISHU_OWNER_ID, FEISHU_GATEWAY_URL,
-    FEISHU_GATEWAY_MODE, DEFAULT_CHAT_DIR,
-    FEISHU_EVENT_MODE, IS_CALLBACK_BACKEND
+    CALLBACK_SERVER_URL, GATEWAY_URL,
+    GATEWAY_MODE, DEFAULT_CHAT_DIR,
+    IS_CALLBACK_BACKEND
 )
+from platforms import get_im_adapter
 from services.card_cache import CardCache
-from services.feishu_api import FeishuAPIService
 from services.request_manager import RequestManager
 from services.ws_registry import WebSocketRegistry
 
@@ -67,8 +67,6 @@ from handlers.http_handler import HttpRequestHandler
 
 SOCKET_PATH = get_config('PERMISSION_SOCKET_PATH', DEFAULT_SOCKET_PATH)
 HTTP_PORT = get_config_positive_int('CALLBACK_SERVER_PORT', int(DEFAULT_HTTP_PORT))
-FEISHU_WEBHOOK_URL = get_config('FEISHU_WEBHOOK_URL', '')
-CLEANUP_INTERVAL = 5  # 清理断开连接的检查间隔（秒）
 
 # 项目根目录 (src/server -> src -> project_root)
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
@@ -83,7 +81,7 @@ logger.info("Logging to: %s (daily rotating)", logger.handlers[0].baseFilename)
 # =============================================================================
 
 def handle_socket_client(conn: socket.socket, addr):
-    """处理来自 permission-notify.sh 的 Socket 连接
+    """处理来自 permission.sh 的 Socket 连接
 
     流程：
         1. 接收请求数据（JSON 格式）
@@ -209,7 +207,7 @@ def run_socket_server():
     """运行 Unix Domain Socket 服务器
 
     功能：
-        监听 Unix Socket，接受来自 permission-notify.sh 的连接
+        监听 Unix Socket，接受来自 permission.sh 的连接
     """
     # 删除已存在的 socket 文件（避免 TOCTOU 竞态条件）
     try:
@@ -238,34 +236,43 @@ def run_cleanup_thread():
         - 清理断开连接（每 5 秒）
         - 清理 pending 连接（每 30 秒）
         - 清理过期数据（每 1 小时）
+
+    单次清理抛异常只记日志，线程继续下一轮——否则该类清理会静默停止
+    （小时级那个一死，所有 store 的过期数据都不再清理）。
     """
-    # 高频清理：断开连接（5秒间隔）
-    def cleanup_disconnected_loop():
+    def _cleanup_loop(interval, name, fn):
         while True:
-            time.sleep(CLEANUP_INTERVAL)
-            RequestManager.get_instance().cleanup_disconnected()
+            time.sleep(interval)
+            try:
+                fn()
+            except Exception as e:
+                logger.error("[cleanup] %s failed: %s", name, e, exc_info=True)
 
-    # 中频清理：pending 连接（30秒间隔）
-    def cleanup_pending_loop():
-        while True:
-            time.sleep(30)
-            ws_registry = WebSocketRegistry.get_instance()
-            if ws_registry:
-                ws_registry.cleanup_expired_pending()
+    # 高频清理（5秒间隔）：断开连接
+    def cleanup_high_freq():
+        RequestManager.get_instance().cleanup_disconnected()
 
-    # 低频清理：过期数据（1小时间隔）
-    def cleanup_expired_loop():
-        while True:
-            time.sleep(3600)  # 1 小时
-            _cleanup_expired_data()
-            # 群聊自动解散数据源在 gateway 侧（GroupChatStore + GroupSessionStore），
-            # 仅 gateway / 单机部署执行；分离部署的 callback 端没有这两个 store，跳过
-            if not IS_CALLBACK_BACKEND:
-                _cleanup_group_chats()
+    # 中频清理（30秒间隔）：过期的 pending 连接
+    def cleanup_mid_freq():
+        ws_registry = WebSocketRegistry.get_instance()
+        if ws_registry:
+            ws_registry.cleanup_expired_pending()
+
+    # 低频清理（1小时间隔）：过期数据 + 群聊自动解散
+    def cleanup_low_freq():
+        _cleanup_expired_data()
+        # 群聊自动解散数据源在 gateway 侧（GroupChatStore + GroupSessionStore），
+        # 仅 gateway / 单机部署执行；分离部署的 callback 端没有这两个 store，跳过
+        if not IS_CALLBACK_BACKEND:
+            _cleanup_group_chats()
 
     # 启动三个独立的清理线程
-    for target in (cleanup_disconnected_loop, cleanup_pending_loop, cleanup_expired_loop):
-        thread = threading.Thread(target=target, daemon=True)
+    for interval, name, fn in (
+        (5, 'high-freq', cleanup_high_freq),     # 断开连接
+        (30, 'mid-freq', cleanup_mid_freq),      # 过期 pending 连接
+        (3600, 'low-freq', cleanup_low_freq),    # 过期数据 + 群聊自动解散
+    ):
+        thread = threading.Thread(target=_cleanup_loop, args=(interval, name, fn), daemon=True)
         thread.start()
 
 
@@ -309,6 +316,11 @@ def _cleanup_expired_data():
         if expired_count > 0:
             logger.info(f"[cleanup] Cleaned {expired_count} expired directory entries")
 
+    # 清理各 IM 平台自有存储中的过期数据
+    platform_cleaned = get_im_adapter().cleanup_expired_data()
+    if platform_cleaned > 0:
+        logger.info(f"[cleanup] Cleaned {platform_cleaned} expired IM platform entries")
+
 
 def _cleanup_group_chats():
     """群聊空闲自动解散维护（cleanup_expired_loop 每小时一次）。
@@ -320,7 +332,11 @@ def _cleanup_group_chats():
       - 否则按该值判断空闲
     """
     try:
-        from handlers.feishu import batch_dissolve_groups, find_idle_group_chats
+        from platforms.base import GroupCapable
+        from services.group_maintenance import batch_dissolve_groups, find_idle_group_chats
+
+        if not isinstance(get_im_adapter(), GroupCapable):
+            return  # 当前平台不支持群聊
 
         group_store = GroupChatStore.get_instance()
         gs_store = GroupSessionStore.get_instance()
@@ -389,50 +405,31 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 # =============================================================================
-# 辅助函数
-# =============================================================================
-
-def _determine_event_mode() -> str:
-    """确定飞书事件接收模式
-
-    auto 模式下自动检测：
-    - lark-oapi 已安装（需 Python >= 3.8）→ longpoll
-    - lark-oapi 未安装 → http
-
-    Returns:
-        事件接收模式: http / longpoll
-    """
-    from services.feishu_longpoll import is_longpoll_available
-    available = is_longpoll_available()
-
-    if FEISHU_EVENT_MODE == 'longpoll':
-        if not available:
-            logger.warning("FEISHU_EVENT_MODE=longpoll but prerequisites not met "
-                           "(need Python >= 3.8 and lark-oapi SDK), falling back to HTTP")
-            return 'http'
-        return 'longpoll'
-
-    if FEISHU_EVENT_MODE == 'http':
-        return 'http'
-
-    if FEISHU_EVENT_MODE != 'auto':
-        logger.warning("Unknown FEISHU_EVENT_MODE=%s, falling back to auto", FEISHU_EVENT_MODE)
-
-    # auto: 有 SDK 则 longpoll，否则 http
-    mode = 'longpoll' if available else 'http'
-    logger.info("Event mode auto-detected: %s", mode)
-    return mode
-
-
-# =============================================================================
 # 主函数
 # =============================================================================
 
 def main():
-    """主函数：启动所有服务
+    """进程入口：注册信号、启动服务、退出时统一清理"""
+    logger.info("Starting Agent Callback Server")
+
+    # setup.sh stop/restart 发的是 SIGTERM，转成 KeyboardInterrupt 复用同一退出路径
+    signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
+
+    server = None
+    try:
+        server = _run_server()
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+    finally:
+        _graceful_shutdown(server)
+
+
+def _run_server():
+    """初始化所有服务组件，返回已就绪的 HTTP server（不进入 serve_forever）
 
     服务组件：
-        1. Unix Socket 服务器 - 接收 permission-notify.sh 的连接
+        1. Unix Socket 服务器 - 接收 permission.sh 的连接
         2. 清理线程 - 定期清理断开连接和过期 session
         3. HTTP 服务器 - 接收飞书按钮的回调请求
         4. RequestManager - 管理待处理的权限请求
@@ -441,10 +438,9 @@ def main():
         7. DirectoryStore - 记录目录使用历史和目录级静音状态
         8. BindingStore - 维护 owner_id 到 callback_url 的绑定（网关专用）
         9. AuthTokenStore - 存储网关注册的 auth_token（Callback 后端专用）
-        10. FeishuAPIService - 飞书 OpenAPI 服务（OpenAPI 模式）
-        11. AutoRegister - 启动时自动向飞书网关注册（可选）
+        10. IMAdapter - IM 平台运行时（按 IM_PLATFORM 选择，负责建连与凭据校验）
+        11. AutoRegister - 启动时自动向网关注册（可选）
     """
-    logger.info("Starting Agent Permission Callback Server")
     logger.info(f"HTTP Port: {HTTP_PORT}")
     logger.info(f"Socket Path: {SOCKET_PATH}")
     env_timeout = os.environ.get('PERMISSION_REQUEST_TIMEOUT', '')
@@ -452,9 +448,6 @@ def main():
         logger.info(f"Request Timeout: {PERMISSION_REQUEST_TIMEOUT}s (from env: PERMISSION_REQUEST_TIMEOUT={env_timeout})")
     else:
         logger.info(f"Request Timeout: {PERMISSION_REQUEST_TIMEOUT}s (default: {DEFAULT_PERMISSION_REQUEST_TIMEOUT}s)")
-
-    if not FEISHU_WEBHOOK_URL:
-        logger.warning("FEISHU_WEBHOOK_URL not set - webhook notifications will be skipped")
 
     # 检测/创建默认聊天目录
     if DEFAULT_CHAT_DIR:
@@ -519,33 +512,24 @@ def main():
     WebSocketRegistry.initialize()
     logger.info("WebSocketRegistry initialized")
 
-    # 初始化飞书 OpenAPI 服务
-    if FEISHU_SEND_MODE == 'openapi':
-        if FEISHU_APP_ID and FEISHU_APP_SECRET:
-            FeishuAPIService.initialize()
-            logger.info(f"Feishu OpenAPI service initialized (mode: {FEISHU_SEND_MODE})")
-        elif FEISHU_GATEWAY_URL:
-            # 分离部署模式：本端是 callback 后端，凭据在网关服务上
-            logger.info("Feishu OpenAPI mode: using gateway (credentials not required)")
-        else:
-            logger.warning("FEISHU_SEND_MODE requires FEISHU_APP_ID and FEISHU_APP_SECRET")
-    else:
-        logger.info(f"Feishu send mode: {FEISHU_SEND_MODE}")
+    # 初始化 IM 平台适配器（按 IM_PLATFORM 选择，默认飞书）
+    try:
+        adapter = get_im_adapter()
+    except (ValueError, ImportError) as e:
+        logger.error("Failed to initialize IM adapter (check IM_PLATFORM in .env): %s", e)
+        raise
+    logger.info("IM adapter initialized: %s", adapter.platform_name())
 
-    # 启动飞书长连接（如果需要）
-    if FEISHU_SEND_MODE == 'openapi' and _determine_event_mode() == 'longpoll':
-        if FEISHU_APP_ID and FEISHU_APP_SECRET:
-            from services.feishu_longpoll import start_feishu_longpoll
-            client = start_feishu_longpoll(FEISHU_APP_ID, FEISHU_APP_SECRET)
-            if client:
-                logger.info("Feishu longpoll mode enabled")
-            else:
-                logger.warning("Feishu longpoll mode failed to start (SDK not available?)")
-        elif FEISHU_GATEWAY_URL:
-            # 分离部署模式：本端是 callback 后端，网关负责长连接
-            logger.info("Feishu longpoll: skipped (callback backend, gateway handles connection)")
-        else:
-            logger.warning("longpoll mode requires FEISHU_APP_ID and FEISHU_APP_SECRET")
+    # 初始化平台运行时（网关侧建连接 / Callback 侧校验凭据，由 adapter 自行决定）
+    # has_gateway: 配置了网关地址（单机部署也为 True，指向本地网关）；
+    # 与 config.IS_CALLBACK_BACKEND（仅分离部署为 True）不是一回事
+    has_gateway = bool(GATEWAY_URL)
+    if not adapter.initialize_runtime(runtime_dir, has_gateway):
+        raise RuntimeError("IM platform runtime not ready")
+
+    # 平台端点预加载：启动期即加载 handlers/<platform> 模块，语法错误
+    # 启动就暴露（fail-fast），而非等到首条事件才 500
+    adapter.gateway_routes()
 
     # 启动 Socket 服务器线程
     socket_thread = threading.Thread(target=run_socket_server)
@@ -561,53 +545,34 @@ def main():
     logger.info(f"HTTP server listening on port {HTTP_PORT} (threading enabled)")
 
     # 连接网关服务
-    # - 分离部署：连接远程网关（FEISHU_GATEWAY_URL 由用户配置）
-    # - 单机部署：连接本地网关（FEISHU_GATEWAY_URL 默认为 CALLBACK_SERVER_URL）
+    # - 分离部署：连接远程网关（GATEWAY_URL 由用户配置）
+    # - 单机部署：连接本地网关（GATEWAY_URL 默认为 CALLBACK_SERVER_URL）
     # ws(s):// → WS 隧道模式；http(s):// → HTTP 回调模式
-    if FEISHU_GATEWAY_URL and FEISHU_OWNER_ID:
-        logger.info("[main] Connecting to gateway at %s (mode=%s)", FEISHU_GATEWAY_URL, "separated" if IS_CALLBACK_BACKEND else "standalone")
+    owner_id = adapter.get_owner_id()
+    if GATEWAY_URL and owner_id:
+        logger.info("[main] Connecting to gateway at %s (mode=%s)", GATEWAY_URL, "separated" if IS_CALLBACK_BACKEND else "standalone")
         # 根据网关模式选择连接方式
-        if FEISHU_GATEWAY_MODE == 'ws':
+        if GATEWAY_MODE == 'ws':
             # WS 隧道模式：客户端主动连接网关，适用于本地开发（callback 不可公网访问）
             from services.ws_tunnel_client import start_ws_tunnel_client
-            from config import (FEISHU_REPLY_IN_THREAD,
-                                FEISHU_SESSION_MODE,
-                                DEFAULT_CHAT_FOLLOW_THREAD,
-                                FEISHU_GROUP_NAME_PREFIX, FEISHU_GROUP_DISSOLVE_DAYS,
-                                FEISHU_GROUP_PREFIX_CHAT_ID,
-                                FEISHU_GROUP_ALLOW_COWORK,
-                                get_default_agent)
-            from agents import get_all_agent_commands
-            all_cmds = get_all_agent_commands()
-            binding_params = {
-                'reply_in_thread': FEISHU_REPLY_IN_THREAD,
-                'session_mode': FEISHU_SESSION_MODE,
-                'default_agent': get_default_agent(),
-                'claude_commands': all_cmds.get('claude'),
-                'codex_commands': all_cmds.get('codex'),
-                'default_chat_dir': DEFAULT_CHAT_DIR,
-                'default_chat_follow_thread': DEFAULT_CHAT_FOLLOW_THREAD,
-                'group_name_prefix': FEISHU_GROUP_NAME_PREFIX,
-                'group_dissolve_days': FEISHU_GROUP_DISSOLVE_DAYS,
-                'group_prefix_chat_id': FEISHU_GROUP_PREFIX_CHAT_ID,
-                'group_allow_cowork': FEISHU_GROUP_ALLOW_COWORK,
-            }
+            from services.auto_register import build_binding_params
+            binding_params = build_binding_params()
             start_ws_tunnel_client(
-                FEISHU_GATEWAY_URL, FEISHU_OWNER_ID,
+                GATEWAY_URL, owner_id,
                 binding_params=binding_params
             )
-            logger.info("WebSocket tunnel client started, gateway: %s", FEISHU_GATEWAY_URL)
+            logger.info("WebSocket tunnel client started, gateway: %s", GATEWAY_URL)
         elif CALLBACK_SERVER_URL:
             # HTTP 回调模式：需要 Callback 后端公网可达
             from services.auto_register import AutoRegister
-            AutoRegister.initialize(CALLBACK_SERVER_URL, FEISHU_OWNER_ID, FEISHU_GATEWAY_URL)
+            AutoRegister.initialize(CALLBACK_SERVER_URL, owner_id, GATEWAY_URL)
             auto_register = AutoRegister.get_instance()
             if auto_register and auto_register.enabled:
                 auto_register.register_in_background()
             else:
                 logger.info("Auto-registration disabled")
     else:
-        # FEISHU_OWNER_ID 未配置：当前服务作为纯粹的飞书网关，不携带用户凭据，无需注册
+        # owner id 未配置：当前服务作为纯粹的网关，不携带用户凭据，无需注册
         logger.info("[main] Running as pure gateway without user credentials")
 
     # 启动遥测服务（后台线程定期上报心跳）
@@ -628,19 +593,11 @@ def main():
     else:
         logger.info("Telemetry service disabled")
 
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        logger.info("Shutting down...")
-
-        # 优雅关闭：通知所有 WS 连接
-        _shutdown_ws_connections()
-
-        server.shutdown()
+    return server
 
 
-def _shutdown_ws_connections():
-    """优雅关闭 WebSocket 连接"""
+def _notify_ws_connections():
+    """通知入站 WS 连接服务即将关闭（网关侧；无连接时为 no-op）"""
     from utils.ws_protocol import ws_send_text
 
     registry = WebSocketRegistry.get_instance()
@@ -663,19 +620,52 @@ def _shutdown_ws_connections():
     # 等待 1 秒让消息发送
     time.sleep(1)
 
-    # 停止 WS 客户端
+    logger.info("[shutdown] WebSocket connections notified")
+
+
+def _stop_ws_tunnel_client():
+    """停止出站 WS 隧道客户端（Callback 侧；未启动时为 no-op）
+
+    与 _notify_ws_connections 相互独立：分离部署的 Callback 只有出站隧道、
+    没有入站连接，不能依附于前者执行。
+    """
     from services.ws_tunnel_client import stop_ws_tunnel_client
     stop_ws_tunnel_client()
 
-    # 停止飞书长连接客户端
-    try:
-        from services.feishu_longpoll import stop_feishu_longpoll
-        stop_feishu_longpoll()
-        logger.info("[shutdown] Feishu longpoll client stopped")
-    except Exception as e:
-        logger.debug("[shutdown] Feishu longpoll stop error: %s", e)
 
-    logger.info("[shutdown] WebSocket connections closed")
+def _graceful_shutdown(server=None):
+    """依次执行各项关闭动作
+
+    每步独立 try：单步失败不影响后续步骤。
+    server 为 None 表示 HTTP 服务尚未创建（初始化途中收到信号）。
+    """
+    # 清理期间忽略后续 SIGTERM，避免中途被打断
+    try:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    except Exception:
+        pass
+
+    steps = [
+        ('notify-ws-connections', _notify_ws_connections),
+        ('ws-tunnel-client', _stop_ws_tunnel_client),
+        ('im-platform', lambda: get_im_adapter().shutdown_runtime()),
+    ]
+    if server is not None:
+        # 用 server_close 而非 shutdown：进入本函数时 serve_forever 要么未启动、
+        # 要么已退出，不需要再中断它；而 shutdown() 在 serve_forever 从未启动时
+        # 会永久阻塞（等一个不会被置位的 Event）
+        steps.append(('http-server', server.server_close))
+
+    for name, fn in steps:
+        try:
+            fn()
+        except Exception as e:
+            logger.warning("[shutdown] %s failed: %s", name, e)
+
+
+def _raise_keyboard_interrupt(signum, frame):
+    """SIGTERM handler：转成 KeyboardInterrupt，走与 Ctrl-C 相同的优雅退出路径"""
+    raise KeyboardInterrupt
 
 
 if __name__ == '__main__':

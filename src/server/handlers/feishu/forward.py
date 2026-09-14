@@ -1,102 +1,36 @@
 """
 Feishu Forward - 请求转发与路由
 
-负责将飞书侧的请求通过 WS 隧道或 HTTP 转发到 Callback 后端：
-- _forward_via_ws_or_http: WS/HTTP 隧道核心路由
+将飞书侧消息/命令触发的请求转发到 Callback 后端（WS/HTTP 传输见
+services/callback_client.py）。卡片回调侧的业务处理见 card_action.py：
 - _forward_agent_request: Agent 请求转发（统一入口）
 - _forward_continue_request: 继续会话转发
 - _forward_new_request: 新会话转发
 - _forward_new_request_for_default_dir: 默认目录新会话转发
 - _forward_attach_request: /attach 转发
 - _forward_stop_request: /stop 转发
-- _forward_permission_request: 权限决策转发
+- _forward_copy_request: /copy 转发
 - _fetch_recent_dirs_from_callback: 获取常用目录
 - _fetch_browse_dirs_from_callback: 浏览子目录
 """
 
 import logging
-import socket
-import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 from utils.concurrency import run_in_background
-from utils.http_client import post_json
+from services.callback_client import forward_via_ws_or_http
 
 from .utils import (
-    TOAST_SUCCESS, TOAST_WARNING, TOAST_ERROR,
     _should_reply_in_thread,
-    _extract_http_error_detail, _get_binding_from_event,
+    _extract_http_error_detail,
 )
 from .message import (
     _send_session_result_notification,
     _send_error_notification,
     _send_notice_message,
-    _add_typing_reaction,
 )
 
 logger = logging.getLogger(__name__)
-
-
-# =============================================================================
-# WebSocket 隧道路由分发
-# =============================================================================
-
-def _forward_via_ws_or_http(binding: Dict[str, Any], endpoint: str, payload: Dict[str, Any],
-                            timeout: Optional[float] = None) -> Optional[Dict[str, Any]]:
-    """通过 WS 或 HTTP 转发请求到 Callback
-
-    根据 callback_url 协议决定转发方式：
-    - ws:// 或 wss:// → 通过 WebSocket 隧道转发
-    - http:// 或 https:// → 通过 HTTP 请求转发
-
-    从 binding 字典中提取路由信息（owner_id、callback_url、auth_token）。
-
-    Args:
-        binding: 绑定信息字典（包含 _owner_id、callback_url、auth_token）
-        endpoint: API 端点（如 /cb/decision, /cb/agent/new）
-        payload: 请求数据
-        timeout: 请求超时（秒），默认使用各通道的默认超时
-
-    Returns:
-        响应数据，失败返回 None
-    """
-    from services.ws_registry import WebSocketRegistry
-
-    owner_id = binding.get('_owner_id', '')
-    callback_url = binding.get('callback_url', '')
-    auth_token = binding.get('auth_token', '')
-
-    # 根据 callback_url 协议决定转发方式
-    is_ws_mode = callback_url.startswith(('ws://', 'wss://'))
-
-    if is_ws_mode:
-        # 尝试通过 WS 转发
-        registry = WebSocketRegistry.get_instance()
-        if owner_id and registry and registry.is_authenticated(owner_id):
-            # 获取该连接的 auth_token 用于本地 handler 验证
-            ws_auth_token = registry.get_auth_token(owner_id)
-            headers = {'X-Auth-Token': ws_auth_token} if ws_auth_token else {}
-            response = registry.send_request(owner_id, endpoint, payload, headers, timeout=timeout)
-            if response is not None:
-                # WS 隧道返回格式: {status: HTTP码, body: 业务响应}
-                # 提取 body 作为真正的业务响应
-                return response.get('body', response)
-        logger.warning("[feishu] WS tunnel not available for %s", owner_id)
-        return None
-
-    # HTTP 模式（ws:// 或 wss:// 是 WS 隧道地址，不能用于 HTTP 请求）
-    if callback_url:
-        api_url = f"{callback_url.rstrip('/')}{endpoint}"
-        http_timeout = int(timeout) if timeout else 10
-        logger.debug("[feishu] Using HTTP for %s: %s", owner_id, api_url)
-        try:
-            return post_json(api_url, payload, headers={'X-Auth-Token': auth_token}, timeout=http_timeout)
-        except Exception as e:
-            logger.error("[feishu] HTTP request failed: %s", e)
-            return None
-
-    logger.warning("[feishu] No callback_url configured for %s", owner_id)
-    return None
 
 
 # =============================================================================
@@ -141,7 +75,7 @@ def _forward_agent_request(binding: Dict[str, Any], endpoint: str,
 
     try:
         # 使用 WS/HTTP 路由分发（保留原 HTTP 模式的 30s 超时）
-        response_data = _forward_via_ws_or_http(binding, endpoint, payload, timeout=30)
+        response_data = forward_via_ws_or_http(binding, endpoint, payload, timeout=30)
 
         if response_data is None:
             raise urllib.error.URLError("No available route (WS or HTTP)")
@@ -448,7 +382,7 @@ def _forward_stop_request(binding: dict, session_id: str,
     """转发 /stop 请求到 Callback 后端"""
     payload = {'session_id': session_id}
     try:
-        response = _forward_via_ws_or_http(binding, '/cb/agent/stop', payload, timeout=10)
+        response = forward_via_ws_or_http(binding, '/cb/agent/stop', payload, timeout=10)
     except Exception as e:
         logger.error("[feishu] /stop forward failed: %s", e)
         _send_notice_message(chat_id, "停止请求失败，请稍后重试", message_id)
@@ -474,155 +408,36 @@ def _forward_stop_request(binding: dict, session_id: str,
 
 
 # =============================================================================
-# 权限决策转发
+# /copy 转发
 # =============================================================================
 
-def _forward_permission_request(request_id: str, original_data: dict, action_type: str,
-                                card_message_id: str = '') -> Tuple[bool, dict]:
-    """转发权限请求到 Callback 服务
+def _forward_copy_request(binding: dict, session_id: str,
+                          chat_id: str, message_id: str) -> None:
+    """转发 /copy 请求到 Callback 后端
 
-    调用 callback 服务的纯决策接口，根据返回的决策结果生成 toast。
-    优先使用 WS 隧道，fallback 到 HTTP。
-    callback_url 从 BindingStore 获取。
-
-    注意：飞书要求在 3 秒内返回响应，timeout 设置为 2 秒预留时间。
-
-    Args:
-        request_id: 请求 ID
-        original_data: 原始飞书事件数据（用于提取绑定信息和 project_dir）
-        action_type: 动作类型 (allow/always/deny/interrupt)
-        card_message_id: 卡片消息 ID（用于添加表情）
-
-    Returns:
-        (handled, toast_response)
+    结果消息（markdown 代码块 / 错误提示）由 callback 侧直接发送，
+    此处只处理传输失败。超时比 /stop 宽松：callback 需解析 transcript
+    提取答复（长会话需数秒）。
     """
-    import urllib.error
-
-    # 提取 project_dir（从原始请求的 value 中获取）
-    event = original_data.get('event', {})
-    action = event.get('action', {})
-    value = action.get('value', {})
-
-    # 获取绑定信息
-    binding = _get_binding_from_event(event)
-    if not binding:
-        logger.warning("[feishu] No binding found for permission request")
-        return True, {
-            'toast': {
-                'type': TOAST_ERROR,
-                'content': '身份验证失败，请重新注册网关'
-            }
-        }
-
-    owner_id = binding.get('_owner_id', '')
-
-    # 构建请求数据
-    request_data = {
-        'action': action_type,
-        'request_id': request_id
+    payload = {
+        'session_id': session_id,
+        'chat_id': chat_id,
+        'message_id': message_id,
     }
-
-    # 添加可选字段
-    if 'project_dir' in value:
-        request_data['project_dir'] = value['project_dir']
-
-    logger.info("[feishu] Forwarding permission request: owner_id=%s, action=%s", owner_id, action_type)
-
-    start_time = time.time()
-
     try:
-        # 使用 WS/HTTP 路由分发
-        # 飞书要求 3 秒内返回，设置 2 秒超时预留处理时间
-        response_data = _forward_via_ws_or_http(binding, '/cb/decision', request_data, timeout=2)
-
-        if response_data is None:
-            logger.warning("[feishu] Forward failed: no available route")
-            return True, {
-                'toast': {
-                    'type': TOAST_ERROR,
-                    'content': '回调服务不可达，请检查服务状态'
-                }
-            }
-
-        elapsed = (time.time() - start_time) * 1000
-
-        success = response_data.get('success', False)
-        decision = response_data.get('decision')
-        message = response_data.get('message', '')
-
-        # 根据决策结果生成 toast
-        response_body = {}
-        if success and decision:
-            if decision == 'allow':
-                toast_type = TOAST_SUCCESS
-            else:  # deny
-                toast_type = TOAST_WARNING
-            toast_content = message or ('已批准运行' if decision == 'allow' else '已拒绝运行')
-            logger.info(f"[feishu] Decision succeeded: decision={decision}, message={message}, elapsed={elapsed:.0f}ms")
-            # 决策成功后，异步添加 Typing 表情（拒绝并中断时不需要，因为预期任务会停止）
-            if action_type != 'interrupt':
-                run_in_background(_add_typing_reaction, (card_message_id,))
-
-            # 尝试在回调响应中返回更新后的卡片（移除按钮，更新状态）
-            from .card_action import _get_updated_card_for_response
-            updated_card = _get_updated_card_for_response(request_id, action_type)
-            if updated_card:
-                response_body['card'] = {
-                    'type': 'raw',
-                    'data': updated_card
-                }
-                logger.debug(f"[feishu] Returning updated card in response for request: {request_id}")
-        else:
-            toast_type = TOAST_ERROR
-            toast_content = message or '处理失败'
-            logger.warning(f"[feishu] Decision failed: message={toast_content}, elapsed={elapsed:.0f}ms")
-
-        response_body['toast'] = {
-            'type': toast_type,
-            'content': toast_content
-        }
-        return True, response_body
-
-    except urllib.error.HTTPError as e:
-        logger.error(f"[feishu] Forward HTTP error: {e.code} {e.reason}")
-        # 401 表示 auth_token 验证失败
-        if e.code == 401:
-            return True, {
-                'toast': {
-                    'type': TOAST_ERROR,
-                    'content': '身份验证失败，请重新注册网关'
-                }
-            }
-        return True, {
-            'toast': {
-                'type': TOAST_ERROR,
-                'content': f'回调服务错误: HTTP {e.code}'
-            }
-        }
-    except urllib.error.URLError as e:
-        logger.error(f"[feishu] Forward URL error: {e.reason}")
-        return True, {
-            'toast': {
-                'type': TOAST_ERROR,
-                'content': '回调服务不可达，请检查服务状态'
-            }
-        }
-    except socket.timeout:
-        logger.error("[feishu] Forward timeout")
-        return True, {
-            'toast': {
-                'type': TOAST_ERROR,
-                'content': '回调服务响应超时'
-            }
-        }
+        response = forward_via_ws_or_http(binding, '/cb/agent/copy', payload, timeout=60)
     except Exception as e:
-        logger.error(f"[feishu] Forward error: {e}")
-        return True, {
-            'toast': {
-                'type': TOAST_ERROR,
-                'content': f'转发失败: {str(e)}'
-            }
-        }
+        logger.error("[feishu] /copy forward failed: %s", e)
+        _send_notice_message(chat_id, "复制请求失败，请稍后重试", message_id)
+        return
+
+    if response is None:
+        _send_notice_message(chat_id, "Callback 服务不可达，请检查服务状态", message_id)
+        return
+
+    if not response.get('ok'):
+        # 具体错误提示已由 callback 侧发送（含 session 过期、找不到 transcript 等）
+        logger.info("[feishu] /copy returned not-ok: %s", response.get('error', ''))
 
 
 # =============================================================================
@@ -646,7 +461,7 @@ def _fetch_recent_dirs_from_callback(binding: Dict[str, Any], limit: int = 5) ->
     }
 
     try:
-        response_data = _forward_via_ws_or_http(binding, '/cb/directory/recent-dirs', request_data)
+        response_data = forward_via_ws_or_http(binding, '/cb/directory/recent-dirs', request_data)
 
         if response_data is None:
             return []
@@ -677,7 +492,7 @@ def _fetch_browse_dirs_from_callback(binding: Dict[str, Any], path: str) -> dict
     }
 
     try:
-        response_data = _forward_via_ws_or_http(binding, '/cb/directory/browse-dirs', request_data)
+        response_data = forward_via_ws_or_http(binding, '/cb/directory/browse-dirs', request_data)
 
         if response_data is None:
             return {}

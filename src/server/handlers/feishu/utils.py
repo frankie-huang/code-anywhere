@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # setup_logging 由 main.py 启动时将 shared/ 加入 sys.path
 from logging_config import setup_logging
+from platforms.models import IMEvent
 from utils.ttl_cache import TTLCache
 
 logger = logging.getLogger(__name__)
@@ -32,7 +33,7 @@ TOAST_ERROR = 'error'
 TOAST_INFO = 'info'
 
 # 协作者允许执行的命令白名单（其余命令仅 owner 可执行）
-_COLLABORATOR_ALLOWED_COMMANDS = {'clear', 'stop'}
+_COLLABORATOR_ALLOWED_COMMANDS = {'clear', 'stop', 'copy'}
 
 # 会话路由失败时的通用反馈文案（/mute /unmute / 主路由等场景共用）
 _SESSION_NOT_FOUND_HINT = "无法找到对应的会话（可能已过期、被清理或服务暂时不可用）。"
@@ -109,11 +110,13 @@ def _extract_http_error_detail(http_error):
 # 日志
 # =========================================================================
 
-def _log_message_event(data: Dict[str, Any], text: str) -> None:
-    """将入站消息事件记录到独立的飞书消息日志（脱敏用户内容）
+def _log_message_event(event: IMEvent) -> None:
+    """将入站消息事件记录到独立的消息日志（脱敏用户内容）
 
     懒加载日志器（线程安全，双重检查），记录事件全量字段 + 解析出的纯文本，
-    供审计/调试使用。日志字段从 data 中提取，text 为上游解析后的纯文本。
+    供审计/调试使用。结构化字段直接读事件属性；content 是平台原始报文里的
+    未解析消息体（IMEvent 不携带），从 raw 挖取——raw 用于日志脱敏记录是
+    models.py 约定允许的用途。
     """
     global _feishu_message_logger
     if _feishu_message_logger is None:
@@ -125,23 +128,19 @@ def _log_message_event(data: Dict[str, Any], text: str) -> None:
                 logger.info("Feishu message logging to: %s (daily rotating)",
                             _feishu_message_logger.handlers[0].baseFilename)
 
-    header = data.get('header', {})
-    event = data.get('event', {})
-    message = event.get('message', {})
-    sender_id_obj = event.get('sender', {}).get('sender_id', {})
-    content = message.get('content', '{}')
+    content = event.raw.get('event', {}).get('message', {}).get('content', '{}')
 
     _feishu_message_logger.info(json.dumps({
-        'event_id': header.get('event_id', ''),
-        'message_id': message.get('message_id', ''),
-        'parent_id': message.get('parent_id', ''),
-        'chat_id': message.get('chat_id', ''),
-        'chat_type': message.get('chat_type', ''),
-        'message_type': message.get('message_type', ''),
-        'sender_id': sender_id_obj.get('open_id', ''),
+        'event_id': event.event_id,
+        'message_id': event.message_id,
+        'parent_id': event.parent_id,
+        'chat_id': event.chat_id,
+        'chat_type': event.chat_type,
+        'message_type': event.message_type,
+        'sender_id': event.sender_open_id,
         'content': _sanitize_user_content(content),
-        'text': _sanitize_user_content(text),
-        'raw_data': data  # 记录完整的原始数据
+        'text': _sanitize_user_content(event.text),
+        'raw_data': event.raw  # 记录完整的原始数据
     }, ensure_ascii=False))
 
 
@@ -215,24 +214,24 @@ def _should_reply_in_thread(binding: Dict[str, Any], project_dir: str) -> bool:
 # Operator / Binding 查找
 # =========================================================================
 
-def _verify_operator_match(operator: dict, owner_id: str) -> bool:
-    """验证 owner_id 是否与 operator 中的某个 ID 匹配
+def _verify_operator_match(operator_id_values: List[str], owner_id: str) -> bool:
+    """验证 owner_id 是否与操作者的某个 ID 匹配
 
-    operator 可能包含 open_id、user_id、union_id 等多个字段，
+    操作者可能有 open_id、user_id、union_id 等多个标识，
     逐一匹配即可，兼容不同格式的 owner_id 配置。
 
     Args:
-        operator: 飞书事件中的 operator 对象
+        operator_id_values: 操作者标识候选值（IMEvent.operator_id_values）
         owner_id: 配置的 owner_id
 
     Returns:
         True 表示匹配成功，False 表示匹配失败
     """
-    if not operator or not owner_id:
+    if not operator_id_values or not owner_id:
         return False
 
-    # 逐一匹配 operator 中的所有字段值
-    for field_value in operator.values():
+    # 逐一匹配操作者的所有标识值
+    for field_value in operator_id_values:
         if field_value == owner_id:
             logger.info(f"[feishu] Operator verification passed: owner_id={owner_id} matched in operator")
             return True
@@ -289,27 +288,20 @@ def _find_cowork_owner(chat_id: str, sender_owner_id: str = '') -> Optional[Dict
     return owner_binding
 
 
-def _get_binding_from_event(feishu_event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """从飞书事件中获取绑定信息
+def find_binding(id_values: List[str], scene: str) -> Optional[Dict[str, Any]]:
+    """按用户标识列表查询绑定信息（逐个尝试，命中即返回）
 
-    通过 sender_id 或 operator_id 查询 BindingStore 获取完整绑定信息。
-    BindingStore.get() 会自动注入 _owner_id 字段。
-
-    两种场景：
-    1. 用户发送消息触发：feishu_event 包含 sender.sender_id
-    2. 用户点击按钮触发：feishu_event 包含 operator（operator 本身就是 id 对象）
+    同一用户在平台内有多个标识（飞书为 open_id / union_id / user_id），
+    binding 用哪个注册的不确定，故逐个尝试。BindingStore.get() 会自动注入
+    _owner_id 字段。
 
     Args:
-        feishu_event: 飞书事件数据（包含 sender 或 operator 信息）
+        id_values: 用户标识候选值（IMEvent.sender_id_values / operator_id_values）
+        scene: 日志用的场景名（sender_id / operator）
 
     Returns:
-        绑定信息字典（包含 auth_token, callback_url, _owner_id 等），未找到返回 None。
+        绑定信息字典（含 auth_token、callback_url、_owner_id 等），未找到返回 None
     """
-    # 协作者模式：上游已注入 owner binding，优先使用
-    effective = feishu_event.get('_effective_binding')
-    if effective:
-        return effective
-
     from stores.binding_store import BindingStore
 
     binding_store = BindingStore.get_instance()
@@ -317,29 +309,16 @@ def _get_binding_from_event(feishu_event: Dict[str, Any]) -> Optional[Dict[str, 
         logger.warning("[feishu] BindingStore not initialized")
         return None
 
-    # 场景 1: 从 sender 获取（用户发送消息时）
-    sender_id_obj = feishu_event.get('sender', {}).get('sender_id', {})
-    if sender_id_obj:
-        for field_value in sender_id_obj.values():
-            if field_value:
-                binding = binding_store.get(field_value)
-                if binding:
-                    logger.info(f"[feishu] Found binding for sender_id={field_value}")
-                    return binding
-        logger.warning(f"[feishu] No binding found for sender={sender_id_obj}")
+    for field_value in id_values:
+        if not field_value:
+            continue
+        binding = binding_store.get(field_value)
+        if binding:
+            logger.info(f"[feishu] Found binding for {scene}={field_value}")
+            return binding
 
-    # 场景 2: 从 operator 获取（用户点击按钮时）
-    # operator 本身就是 id 对象 {open_id, user_id, union_id}
-    operator = feishu_event.get('operator', {})
-    if operator:
-        for field_value in operator.values():
-            if field_value:
-                binding = binding_store.get(field_value)
-                if binding:
-                    logger.info(f"[feishu] Found binding for operator={field_value}")
-                    return binding
-        logger.warning(f"[feishu] No binding found for operator={operator}")
-
+    if id_values:
+        logger.warning(f"[feishu] No binding found for {scene}={id_values}")
     return None
 
 

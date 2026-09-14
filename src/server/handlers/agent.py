@@ -15,7 +15,8 @@ import time
 import uuid
 from typing import Callable, Optional, Tuple, Dict, Any
 
-from agents import AgentAdapter, launch_agent, get_agent_adapter
+from agents import (AgentAdapter, launch_agent, get_agent_adapter,
+                    try_queue_fallback)
 from stores.session_chat_store import SessionChatStore
 from utils.concurrency import run_in_background
 
@@ -140,9 +141,6 @@ def handle_continue_session(data: Dict[str, Any],
             '无效的命令 "%s"，%s 可用命令: %s' % (command, adapter.display_name, available),
             agent_type=adapter.agent_type)
 
-    # 斜杠命令检测：从 prompt 解析，匹配 adapter 声明的命令时走框架路径
-    on_complete = _resolve_slash_command_callback(adapter, prompt)
-
     # Command 优先级: 请求指定 > session 记录 > 默认
     if not command:
         command = session_data.get('command', '')
@@ -179,9 +177,21 @@ def handle_continue_session(data: Dict[str, Any],
         # 飞书发起的 prompt 已在飞书展示，标记跳过
         session_store.set_skip_next_user_prompt(session_id)
 
-        # ── 包装回调：完成后清 PID + 执行队列下一条 ──
+        # ── 回调准备与包装：完成后清 PID + 执行队列下一条 ──
+        # 斜杠命令检测：从 prompt 解析，匹配 adapter 声明的命令时走框架路径
+        on_complete = _resolve_slash_command_callback(adapter, prompt)
         wrapped_complete = _wrap_with_queue_drain(on_complete)
-        wrapped_error = _wrap_with_queue_drain(_send_error_notification)
+
+        # 错误回调带降级：会话被其他进程持有（撞锁）时 prompt 改投其队列
+        def on_error_with_fallback(agent_type: str, chat_id: str, message_id: str,
+                                   session_id: str, error_msg: str):
+            if try_queue_fallback(agent_type, session_id, project_dir,
+                                  actual_cmd, prompt, error_msg):
+                _send_queued_notification(agent_type, chat_id, message_id, session_id)
+            else:
+                _send_error_notification(agent_type, chat_id, message_id, session_id, error_msg)
+
+        wrapped_error = _wrap_with_queue_drain(on_error_with_fallback)
 
         # 通过 agent 适配层启动进程
         success, pid, response = launch_agent(
@@ -275,9 +285,6 @@ def handle_new_session(data: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
             '无效的命令 "%s"，%s 可用命令: %s' % (command, adapter.display_name, available),
             agent_type=adapter.agent_type)
 
-    # 斜杠命令检测：从 prompt 解析，匹配 adapter 声明的命令时走框架路径
-    on_complete = _resolve_slash_command_callback(adapter, prompt)
-
     actual_cmd = adapter.resolve_command(command)
     logger.info("[%s-new] Session: %s, Dir: %s, Cmd: %s, Prompt: %s...",
                 adapter.agent_type, session_id, project_dir, actual_cmd, prompt[:50])
@@ -317,8 +324,11 @@ def handle_new_session(data: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
     if skip_user_prompt:
         session_store.set_skip_next_user_prompt(session_id)
 
-    # ── 包装回调：完成后清 PID + 执行队列下一条 ──
+    # ── 回调准备与包装：完成后清 PID + 执行队列下一条 ──
+    # 斜杠命令检测：从 prompt 解析，匹配 adapter 声明的命令时走框架路径
+    on_complete = _resolve_slash_command_callback(adapter, prompt)
     wrapped_complete = _wrap_with_queue_drain(on_complete)
+    # 新会话每次生成新 ID，无撞锁场景，错误直接通知（降级仅续聊路径需要）
     wrapped_error = _wrap_with_queue_drain(_send_error_notification)
 
     # 通过 agent 适配层启动进程
@@ -371,6 +381,40 @@ def _resolve_slash_command_callback(adapter: AgentAdapter, prompt: str) -> Optio
 # =============================================
 
 
+def _send_queued_notification(agent_type: str, chat_id: str, message_id: str,
+                              session_id: str):
+    """发送「消息已排队到运行中会话」的通知
+
+    exec resume 因会话被其他进程持有（active writer）失败、降级
+    codex queue 成功时触发：turn 由运行中的会话执行，本侧不再发
+    完成通知。
+    """
+    from handlers.outbound import remove_typing, reply_text
+
+    try:
+        adapter = get_agent_adapter(agent_type or None)
+    except ValueError:
+        logger.warning("Unknown agent_type for queued notification: %s", agent_type)
+        adapter = get_agent_adapter()
+
+    # 移除原消息上的 Typing 表情
+    remove_typing(chat_id, message_id)
+
+    text = (f"📌 {adapter.display_name} 会话正在其他窗口（终端/桌面端）运行中，"
+            f"消息已加入该会话队列，将由运行中的会话继续处理。")
+    success, sent_id = reply_text(text, chat_id, message_id)
+
+    # 更新 session 状态。注意：不清 skip_next_user_prompt——队列消息被运行中的
+    # 会话消费时会触发其 user_prompt hook，靠该标志跳过 prompt 回显（与正常
+    # exec resume 路径同一去重机制）；stop hook 通知保留（飞书问的问题在飞书收完成通知）
+    session_store = SessionChatStore.get_instance()
+    if session_store and session_id:
+        if success and sent_id:
+            session_store.set_last_message_id(session_id, sent_id)
+            logger.info("[%s] Updated last_message_id: %s -> %s",
+                        adapter.agent_type, session_id, sent_id)
+
+
 def _send_error_notification(agent_type: str, chat_id: str, message_id: str,
                              session_id: str, error_msg: str):
     """发送错误通知到飞书
@@ -385,7 +429,7 @@ def _send_error_notification(agent_type: str, chat_id: str, message_id: str,
         session_id: 会话 ID（用于更新 session 状态）
         error_msg: 错误消息
     """
-    from handlers.outbound import remove_feishu_typing, reply_feishu_text
+    from handlers.outbound import remove_typing, reply_text
 
     try:
         adapter = get_agent_adapter(agent_type or None)
@@ -394,11 +438,11 @@ def _send_error_notification(agent_type: str, chat_id: str, message_id: str,
         adapter = get_agent_adapter()
 
     # 移除原消息上的 Typing 表情
-    remove_feishu_typing(message_id)
+    remove_typing(chat_id, message_id)
 
     truncated = error_msg[:MAX_ERROR_NOTIFICATION_LENGTH] if len(error_msg) > MAX_ERROR_NOTIFICATION_LENGTH else error_msg
     text = f"❌ {adapter.display_name} 执行异常:\n{truncated}"
-    success, sent_id = reply_feishu_text(chat_id, message_id, text)
+    success, sent_id = reply_text(text, chat_id, message_id)
     if success:
         logger.info("[%s] Sent error notification to %s", adapter.agent_type, chat_id)
     else:
@@ -430,7 +474,7 @@ def _send_complete_notification(agent_type: str, chat_id: str, message_id: str,
         session_id: 会话 ID（用于更新 last_message_id）
         output: 命令输出内容（有内容时直接展示，为空时发送通用完成文案）
     """
-    from handlers.outbound import remove_feishu_typing, reply_feishu_text, reply_feishu_markdown
+    from handlers.outbound import remove_typing, reply_text, reply_markdown
 
     try:
         adapter = get_agent_adapter(agent_type or None)
@@ -440,21 +484,21 @@ def _send_complete_notification(agent_type: str, chat_id: str, message_id: str,
     log_prefix = '[%s]' % adapter.agent_type
 
     # 移除原消息上的 Typing 表情
-    remove_feishu_typing(message_id)
+    remove_typing(chat_id, message_id)
 
     # 回复完成文案：有输出时用卡片展示 markdown，无输出时发送纯文本完成提示
     output = output.strip() if output else ''
     if output and len(output) > MAX_COMPLETE_OUTPUT_LENGTH:
         output = output[:MAX_COMPLETE_OUTPUT_LENGTH] + '\n\n...(内容过长，已截断)'
     if output:
-        success, sent_id = reply_feishu_markdown(chat_id, message_id, output)
+        success, sent_id = reply_markdown(output, chat_id, message_id)
         if not success:
             # 卡片发送失败，降级为纯文本
             logger.warning("%s Markdown card failed, fallback to text: %s", log_prefix, sent_id)
-            success, sent_id = reply_feishu_text(chat_id, message_id, output)
+            success, sent_id = reply_text(output, chat_id, message_id)
     else:
         text = f"✅ {adapter.display_name} 指令已完成"
-        success, sent_id = reply_feishu_text(chat_id, message_id, text)
+        success, sent_id = reply_text(text, chat_id, message_id)
     if success:
         logger.info("%s Sent complete notification to %s", log_prefix, chat_id)
     else:
@@ -480,11 +524,11 @@ def _send_unmute_notification(chat_id: str, session_id: str, message_id: str = '
         session_id: 会话 ID
         message_id: 要回复的消息 ID（可选）
     """
-    from handlers.outbound import reply_feishu_text
+    from handlers.outbound import reply_text
 
     sid_tag = session_id[:8]
     text = f"已自动解除 session `{sid_tag}` 的静音。"
-    success, result = reply_feishu_text(chat_id, message_id, text)
+    success, result = reply_text(text, chat_id, message_id)
     if success:
         logger.info("Sent unmute notification to %s", chat_id)
     else:
@@ -509,8 +553,8 @@ def _wrap_with_queue_drain(original_callback: Optional[Callable]) -> Callable:
             logger.info("[queue] Stopped flag detected, skipping notification: %s",
                         session_id)
             store.check_and_clear_skip_user_prompt(session_id)
-            from handlers.outbound import remove_feishu_typing  # 延迟导入避免循环依赖
-            remove_feishu_typing(message_id)
+            from handlers.outbound import remove_typing  # 延迟导入避免循环依赖
+            remove_typing(chat_id, message_id)
         elif original_callback:
             original_callback(agent_type, chat_id, message_id, session_id, output_or_error)
 
@@ -569,8 +613,8 @@ def _execute_queued_prompt(session_id: str, data: Dict[str, Any]):
     # last_message_id 不必再写：reply_to 由 launch_agent 注入的 CODE_ANYWHERE_MESSAGE_ID 提供
     message_id = data.get('message_id', '') or ''
     if message_id:
-        from handlers.outbound import add_feishu_typing
-        add_feishu_typing(message_id)
+        from handlers.outbound import add_typing
+        add_typing(data.get('chat_id', '') or '', message_id)
 
     success, response = handle_continue_session(data, from_queue=True)
     if not success:

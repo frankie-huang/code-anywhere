@@ -174,31 +174,31 @@
 
 ### Requirement: 默认中心网关地址与模式检测
 
-当 `FEISHU_SEND_MODE=openapi` 时，Callback 端 MUST 根据 `FEISHU_GATEWAY_URL` 的值决定部署模式：未设置则默认连中心网关，`local` 表示 standalone，其他值表示自建网关。
+当 `FEISHU_SEND_MODE=openapi` 时，Callback 端 MUST 根据 `GATEWAY_URL` 的值决定部署模式：未设置则默认连中心网关，`local` 表示 standalone，其他值表示自建网关。
 
 #### Scenario: 普通用户开箱即用（无 GATEWAY_URL）
 
 - **GIVEN** `FEISHU_SEND_MODE=openapi`
 - **AND** 配置了 `FEISHU_APP_ID` + `FEISHU_OWNER_ID`
-- **AND** 未配置 `FEISHU_GATEWAY_URL`
+- **AND** 未配置 `GATEWAY_URL`
 - **WHEN** Callback 启动
-- **THEN** `FEISHU_GATEWAY_URL` 默认为中心网关地址
+- **THEN** `GATEWAY_URL` 默认为中心网关地址
 - **AND** 以多应用轻量模式连接中心网关（app_id + owner_id）
 
 #### Scenario: 应用管理员首次接入（有 APP_SECRET，无 GATEWAY_URL）
 
 - **GIVEN** `FEISHU_SEND_MODE=openapi`
 - **AND** 配置了 `FEISHU_APP_ID` + `FEISHU_APP_SECRET` + `FEISHU_OWNER_ID`
-- **AND** 未配置 `FEISHU_GATEWAY_URL`
+- **AND** 未配置 `GATEWAY_URL`
 - **WHEN** Callback 启动
-- **THEN** `FEISHU_GATEWAY_URL` 默认为中心网关地址
+- **THEN** `GATEWAY_URL` 默认为中心网关地址
 - **AND** 以管理员模式连接中心网关（携带 app_secret 注册应用）
 
 #### Scenario: Standalone 模式（GATEWAY_URL=local）
 
 - **GIVEN** `FEISHU_SEND_MODE=openapi`
 - **AND** 配置了 `FEISHU_APP_ID` + `FEISHU_APP_SECRET` + `FEISHU_OWNER_ID`
-- **AND** `FEISHU_GATEWAY_URL=local`
+- **AND** `GATEWAY_URL=local`
 - **WHEN** Callback 启动
 - **THEN** 以 standalone 模式运行（网关 + callback 同进程）
 - **AND** 不连接任何远程网关
@@ -206,7 +206,7 @@
 #### Scenario: 自建网关用户显式指定地址
 
 - **GIVEN** `FEISHU_SEND_MODE=openapi`
-- **AND** `FEISHU_GATEWAY_URL=wss://my-gateway.com`
+- **AND** `GATEWAY_URL=wss://my-gateway.com`
 - **WHEN** Callback 启动
 - **THEN** 连接到用户指定的网关地址
 - **AND** 不使用中心网关默认地址
@@ -216,7 +216,7 @@
 - **GIVEN** `FEISHU_SEND_MODE=webhook`
 - **WHEN** Callback 启动
 - **THEN** 走 webhook 模式
-- **AND** 忽略 `FEISHU_GATEWAY_URL` 配置
+- **AND** 忽略 `GATEWAY_URL` 配置
 
 ### Requirement: 多应用场景下的功能兼容
 

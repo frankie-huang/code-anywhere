@@ -13,11 +13,11 @@ import re
 import shlex
 from typing import Any, Dict, Tuple
 
+from platforms.models import IMEvent
 from utils.concurrency import run_in_background
+from services.callback_client import forward_via_ws_or_http
 
-from .utils import _get_binding_from_event
 from .message import _send_notice_message
-from .forward import _forward_via_ws_or_http
 
 logger = logging.getLogger(__name__)
 
@@ -92,14 +92,11 @@ def _parse_notify_args(args: str) -> Tuple:
     raise ValueError('Unsupported notify command')
 
 
-def _handle_notify_command(data: dict, args: str) -> None:
+def _handle_notify_command(event: IMEvent, args: str, binding: dict) -> None:
     """处理 /notify 命令：管理通知相关运行时配置。"""
-    event = data.get('event', {})
-    message = event.get('message', {})
-    chat_id = message.get('chat_id', '')
-    message_id = message.get('message_id', '')
+    chat_id = event.chat_id
+    message_id = event.message_id
 
-    binding = _get_binding_from_event(event)
     if not binding:
         return
 
@@ -145,7 +142,7 @@ def _forward_notify_command(binding: Dict[str, Any], parsed: Tuple,
         payload['delay'] = parsed[1]
 
     try:
-        resp = _forward_via_ws_or_http(binding, '/cb/notify/config', payload)
+        resp = forward_via_ws_or_http(binding, '/cb/notify/config', payload)
     except Exception as e:
         logger.error("[feishu] /cb/notify/config error: %s", e)
         resp = None

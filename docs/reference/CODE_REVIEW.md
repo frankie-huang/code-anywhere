@@ -175,7 +175,7 @@ with self._pending_lock:
 
 | 文件 | 行号 | 上下文 |
 |------|------|--------|
-| `src/hooks/stop.sh` | 308 | `json.loads(line)` 解析 |
+| `src/lib/transcript.sh` | 322 | `json.loads(line)` 解析（原 stop.sh:308，随提取函数迁出） |
 | `src/lib/feishu.sh` | 2137 | `json.loads()` 解析 questions |
 | `src/lib/tool.sh` | 128 | 工具描述格式化 |
 

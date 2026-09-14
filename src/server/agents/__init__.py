@@ -17,9 +17,10 @@ from typing import Callable, Dict, List, Optional, Set, Tuple, Any
 logger = logging.getLogger(__name__)
 
 # ── 常量 ──
-STARTUP_TIMEOUT_SECONDS = 30   # 后台启动阶段等待时间（秒），兜住延迟失败
-STARTUP_CHECK_SECONDS = 2      # 启动检查等待时间（秒）
-MAX_LOG_LENGTH = 500           # 日志最大长度
+STARTUP_TIMEOUT_SECONDS = 30         # 后台启动阶段等待时间（秒），兜住延迟失败
+STARTUP_CHECK_SECONDS = 2            # 启动检查等待时间（秒）
+QUEUE_FALLBACK_TIMEOUT_SECONDS = 30  # 锁冲突降级 queue 命令的执行超时（秒）
+MAX_LOG_LENGTH = 500                 # 日志最大长度
 
 # on_error 回调类型: (agent_type, chat_id, message_id, session_id, error_msg) -> None
 ErrorCallback = Optional[Callable[[str, str, str, str, str], None]]
@@ -202,6 +203,51 @@ class AgentAdapter(ABC):
         """
         return {}
 
+    # 并发会话冲突错误的特征表：is_concurrent_session_error 按表做子串匹配
+    CONCURRENT_SESSION_ERROR_MARKERS: Tuple[str, ...] = ()
+
+    @property
+    def supports_queue(self) -> bool:
+        """是否支持向运行中的会话队列投递消息（撞锁降级路径）
+
+        默认 False。声明 True 的子类同时须声明 CONCURRENT_SESSION_ERROR_MARKERS
+        特征表并实现 build_queue_command_string。
+        """
+        return False
+
+    def is_concurrent_session_error(self, error_msg: str) -> bool:
+        """判断命令失败是否因会话被其他进程并发持有（锁冲突）
+
+        基类按 CONCURRENT_SESSION_ERROR_MARKERS 特征表做子串匹配，子类只填表。
+        命中时启动流程会降级为 build_queue_command_string 把消息投递给
+        运行中的会话。
+
+        Args:
+            error_msg: 子进程失败的完整错误信息（stdout/stderr 合并）
+
+        Returns:
+            True 表示错误为并发写锁冲突
+        """
+        return any(marker in error_msg
+                   for marker in self.CONCURRENT_SESSION_ERROR_MARKERS)
+
+    def build_queue_command_string(self, command_name: str, session_id: str,
+                                   prompt: str, debug: bool = False) -> Optional[str]:
+        """构建向现有会话队列投递消息的命令（锁冲突降级路径）
+
+        默认 None 表示该 agent 无此能力，锁冲突时按普通失败处理。
+
+        Args:
+            command_name: agent 命令
+            session_id: 会话 ID
+            prompt: 要投递的用户消息（debug=True 时以 PROMPT 占位）
+            debug: True 时构建脱敏的日志版本
+
+        Returns:
+            可执行的命令字符串，不支持时返回 None
+        """
+        return None
+
 
 # =============================================
 # 共享工具函数
@@ -374,6 +420,23 @@ def get_agent_adapter(agent_type: Optional[str] = None) -> AgentAdapter:
     return adapter
 
 
+def get_agent_display_name(agent_type: str = '', default: str = 'Agent') -> str:
+    """产品名，agent_type 非白名单值时降级为 default
+
+    渲染类调用方（通知文案、卡片标题）用此函数而非直接取 adapter：
+    agent_type 常来自 callback 响应或历史 session 记录，跨版本可能带
+    不在 VALID_AGENTS 内的值，直接调 get_agent_adapter 会抛 ValueError；
+    若调用点在后台线程里，整条通知会静默丢失。空值走 DEFAULT_AGENT
+    配置（已在 get_default_agent 内做白名单兜底），不会到降级分支。
+    """
+    try:
+        return get_agent_adapter(agent_type or None).display_name
+    except ValueError:
+        logger.warning("Unknown agent_type %r, display name falls back to %r",
+                       agent_type, default)
+        return default
+
+
 def get_all_agent_commands() -> Dict[str, List[str]]:
     """获取所有启用 agent 的命令映射
 
@@ -458,6 +521,10 @@ def launch_agent(adapter: AgentAdapter, session_id: str, project_dir: str, promp
     # start_new_session=True 使 PID == PGID，便于 /stop 用 os.killpg
     # 杀整个进程组（含 agent 子进程），否则 SIGTERM 只杀 wrapper shell
     env = adapter.build_env(os.environ.copy())
+    # 先清继承值：服务若从带这两个变量的上下文启动（如 agent 会话内跑 ./setup.sh restart），
+    # os.environ 会被污染，下面的条件注入在值为空时不覆盖，脏值会串到本次会话的卡片 reply_to/at
+    env.pop('CODE_ANYWHERE_MESSAGE_ID', None)
+    env.pop('CODE_ANYWHERE_SENDER_ID', None)
     # hook 子进程读 CODE_ANYWHERE_MESSAGE_ID 作为卡片 reply_to
     # 避开共享 last_message_id 在 drain/stop hook 间的并发竞态
     if message_id:
@@ -630,6 +697,85 @@ def _rename_session_in_store(old_id: str, new_id: str,
     return old_id
 
 
+def try_queue_fallback(agent_type: str, session_id: str, project_dir: str,
+                       command_name: str, prompt: str, error_msg: str) -> bool:
+    """并发会话锁冲突时，降级为向现有会话队列投递消息
+
+    exec resume 报 "already has an active writer" 说明会话有活跃 writer
+    （终端 TUI / 桌面端等），队列消息会由该进程消费；queue 为瞬时命令，
+    同步执行即可。adapter 不支持队列投递、非锁冲突错误、queue 执行失败
+    （如旧版 CLI 无 queue 子命令）均返回 False，调用方按普通失败处理。
+
+    Args:
+        agent_type: agent 类型标识
+        session_id: 会话 ID
+        project_dir: 会话项目目录——与正常启动路径一致作为子进程 cwd，
+                     相对路径命令（如项目内 ./codex-wrapper）依赖它解析
+        command_name: agent 命令
+        prompt: 要投递的用户消息
+        error_msg: 原命令失败的完整错误信息（用于特征匹配）
+
+    Returns:
+        True 表示投递成功
+    """
+    try:
+        adapter = get_agent_adapter(agent_type)
+    except ValueError:
+        return False
+    if not adapter.supports_queue:
+        return False
+    if not adapter.is_concurrent_session_error(error_msg):
+        return False
+    queue_cmd = adapter.build_queue_command_string(command_name, session_id, prompt)
+    if not queue_cmd:
+        return False
+
+    logger.info("[%s] Session %s has an active writer, falling back to queue",
+                agent_type, session_id)
+    debug_cmd = adapter.build_queue_command_string(command_name, session_id,
+                                                   '', debug=True)
+    logger.info("[%s] Executing: %s", agent_type, debug_cmd or queue_cmd)
+    from utils.shell import build_shell_cmd
+    try:
+        # start_new_session 遵循 build_shell_cmd 调用约定（见其 docstring）；
+        # cwd/env 对齐 launch_agent（project_dir + build_env），否则相对路径
+        # 命令解析失败、adapter 的环境适配（如 claude 清 CLAUDECODE）不生效
+        result = subprocess.run(
+            build_shell_cmd(get_shell(), queue_cmd),
+            cwd=project_dir or None,
+            env=adapter.build_env(os.environ.copy()),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=QUEUE_FALLBACK_TIMEOUT_SECONDS,
+            start_new_session=True)
+    except Exception as e:
+        logger.warning("[%s] Queue fallback failed to run: %s", agent_type, e)
+        return False
+    if result.returncode != 0:
+        logger.warning("[%s] Queue fallback exit %s, stderr: %s, stdout: %s",
+                       agent_type, result.returncode,
+                       (result.stderr or '')[:MAX_LOG_LENGTH],
+                       (result.stdout or '')[:MAX_LOG_LENGTH])
+        return False
+    logger.info("[%s] Prompt queued to session %s: %s",
+                agent_type, session_id, (result.stdout or '').strip())
+    return True
+
+
+def is_concurrent_session_error(agent_type: str, error_msg: str) -> bool:
+    """错误是否为「会话被其他进程持有」的锁冲突（供监控层判定用）
+
+    _check_and_monitor 用它决定快速失败时是否让网关静默——降级投递与
+    通知由 callback 侧的错误处理器负责，此处只做判定，不产生副作用。
+    """
+    try:
+        return get_agent_adapter(agent_type).is_concurrent_session_error(error_msg)
+    except ValueError:
+        return False
+
+
 def _check_and_monitor(proc: subprocess.Popen, agent_type: str,
                        session_id: str, chat_id: str = '',
                        message_id: str = '',
@@ -704,6 +850,12 @@ def _check_and_monitor(proc: subprocess.Popen, agent_type: str,
         if chat_id and on_error:
             run_in_background(on_error,
                               (agent_type, chat_id, message_id, session_id, error_msg))
+            # 锁冲突由 on_error 侧降级投递并发提示，网关再按 error 发一条会重复；
+            # 借用 notification_handled 通道让网关静默（语义同 /compact 快速完成）
+            if is_concurrent_session_error(agent_type, error_msg):
+                return True, 0, {'status': 'completed', 'session_id': session_id,
+                                 'agent_type': agent_type,
+                                 'notification_handled': True}
         return False, 0, {'error': error_msg, 'agent_type': agent_type}
 
 

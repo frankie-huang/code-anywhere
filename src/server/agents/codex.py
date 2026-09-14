@@ -18,6 +18,19 @@ logger = logging.getLogger(__name__)
 class CodexAdapter(AgentAdapter):
     """OpenAI Codex CLI 适配器"""
 
+    # exec resume 撞上其他进程持有的会话时的错误特征。
+    # 只保留精确特征（真实错误全文见 2026-09-07 codex 进程日志：
+    # "thread-store conflict: thread <id> already has an active writer"）；
+    # 不用宽前缀 "thread-store conflict" 单独匹配——若未来出现非 writer 的
+    # thread-store 冲突（如 store 损坏），误判为锁冲突会把消息投进无消费者
+    # 的队列，静默滞留，破坏「锁冲突 ⟺ 队列有人消费」的自洽性
+    CONCURRENT_SESSION_ERROR_MARKERS = ('already has an active writer',)
+
+    @property
+    def supports_queue(self) -> bool:
+        """codex queue 子命令（CLI ≥0.149）支持向运行中的会话投递消息"""
+        return True
+
     @property
     def agent_type(self) -> str:
         return 'codex'
@@ -118,3 +131,21 @@ class CodexAdapter(AgentAdapter):
         except (ValueError, TypeError, AttributeError):
             pass
         return None
+
+    def build_queue_command_string(self, command_name: str, session_id: str,
+                                   prompt: str, debug: bool = False) -> Optional[str]:
+        """构建向现有会话队列投递消息的命令（锁冲突降级路径）
+
+        codex queue --thread <id> --message <text> 把消息写入 Codex 本地
+        队列（~/.codex/queue_1.sqlite），由持有该会话的活跃进程消费。
+        与 exec 路径同构地走 CODEX_ARGS_TEMPLATE 和 env overrides
+        （wrapper 配置下降级同样可用，默认模板下展开与直拼逐字相同）；
+        queue 子命令无 --skip-git-repo-check 选项，不注入。
+        """
+        from config import get_codex_args_template
+
+        cmd_argv = shlex.split(self.resolve_command(command_name))
+        message = 'PROMPT' if debug else prompt
+        args_argv = ['queue', '--thread', session_id, '--message', message]
+        cmd_str = expand_template(get_codex_args_template(), cmd_argv, args_argv)
+        return prepend_env_overrides(session_id, cmd_str, redact=debug)

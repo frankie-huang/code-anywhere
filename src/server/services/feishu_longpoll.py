@@ -207,14 +207,15 @@ class FeishuLongPollClient:
         self,
         app_id: str,
         app_secret: str,
-        event_handler: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+        event_handler: Callable[[Dict[str, Any]], Dict[str, Any]],
     ):
         """初始化客户端
 
         Args:
             app_id: 飞书应用 App ID
             app_secret: 飞书应用 App Secret
-            event_handler: 事件处理回调，接收 dict 数据，返回 response dict
+            event_handler: 事件处理回调（必需），接收 dict 数据，返回 response dict。
+                由平台适配层注入——本模块只做 SDK 封装，不认识 handlers
         """
         if not HAS_LARK_SDK:
             raise ImportError("lark-oapi SDK not installed. Run: pip install lark-oapi")
@@ -263,11 +264,13 @@ class FeishuLongPollClient:
             except Exception as e:
                 logger.debug("[feishu-lp] Error closing WebSocket: %s", e)
 
-        # 等待线程退出（最多 5 秒）
+        # 等待线程退出（最多 2 秒）
+        # SDK 内部连接常无法被 close 打断，线程多半要等到超时；它是 daemon，
+        # 进程退出时会被回收，等更久没有实际收益
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=5.0)
+            self._thread.join(timeout=2.0)
             if self._thread.is_alive():
-                logger.warning("[feishu-lp] Thread did not exit within 5s")
+                logger.warning("[feishu-lp] Thread did not exit within 2s")
             else:
                 logger.info("[feishu-lp] Thread exited cleanly")
 
@@ -321,10 +324,10 @@ class FeishuLongPollClient:
         def handler(event: Any) -> None:
             try:
                 data = _marshal_sdk_event(event, event_type)
-                if data and self._event_handler:
+                if data:
                     logger.info("[feishu-lp] Received event: %s", event_type)
                     self._event_handler(data)
-                elif not data:
+                else:
                     logger.warning("[feishu-lp] Failed to convert event: %s", event_type)
             except Exception as e:
                 logger.error("[feishu-lp] Handler error for %s: %s",
@@ -345,7 +348,7 @@ class FeishuLongPollClient:
         """
         try:
             data = _marshal_sdk_event(trigger, 'card.action.trigger')
-            if not data or not self._event_handler:
+            if not data:
                 return P2CardActionTriggerResponse({})
 
             logger.info("[feishu-lp] Received card action")
@@ -374,37 +377,18 @@ def is_longpoll_available() -> bool:
     return HAS_LARK_SDK
 
 
-def _default_event_handler(data: Dict[str, Any]) -> Dict[str, Any]:
-    """默认事件处理函数
-
-    将事件传递给 handle_feishu_request 处理。
-    长连接模式下跳过 token 验证（连接已通过 App ID/Secret 认证）。
-
-    Args:
-        data: 飞书事件数据（格式与 HTTP 回调一致）
-
-    Returns:
-        response dict（卡片回调时包含 toast 等字段）
-    """
-    from handlers.feishu import handle_feishu_request
-    try:
-        handled, response = handle_feishu_request(data, skip_token_validation=True)
-        logger.debug("[feishu-lp] Event handled: handled=%s", handled)
-        return response
-    except Exception as e:
-        logger.error("[feishu-lp] Event handling error: %s", e, exc_info=True)
-        return {}
-
-
 def start_feishu_longpoll(
     app_id: str,
     app_secret: str,
+    event_handler: Callable[[Dict[str, Any]], Dict[str, Any]],
 ) -> Optional[FeishuLongPollClient]:
     """启动飞书长连接客户端
 
     Args:
         app_id: 飞书应用 App ID
         app_secret: 飞书应用 App Secret
+        event_handler: 事件处理回调（接收事件 dict，返回 response dict），
+            由平台适配层传入——本模块只做 SDK 封装，不认识 handlers
 
     Returns:
         客户端实例，SDK 未安装时返回 None
@@ -420,7 +404,7 @@ def start_feishu_longpoll(
             logger.warning("[feishu-lp] Client already exists")
             return _client_instance
 
-        _client_instance = FeishuLongPollClient(app_id, app_secret, _default_event_handler)
+        _client_instance = FeishuLongPollClient(app_id, app_secret, event_handler)
         _client_instance.start()
         return _client_instance
 

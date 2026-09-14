@@ -9,11 +9,10 @@ GET 路由：
     - /allow, /always, /deny, /interrupt: 权限决策回调
 
 POST 路由：
-    - /gw/*: 飞书网关侧路由
-        - /gw/register: Callback 后端注册
-        - /gw/feishu/send: 发送飞书消息
-        - /gw/feishu/create-group: 创建飞书群聊
+    - /gw/register: Callback 后端注册（平台无关）
+    - 平台自有端点: 由 adapter.gateway_routes() 声明，统一 owner 鉴权后分发
     - /cb/*: Callback 后端侧路由（通过路由表分发）
+    - 兜底: 平台事件回调交 adapter.handle_inbound_event
 """
 
 import json
@@ -21,10 +20,8 @@ import logging
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
+from platforms import get_im_adapter
 from services.auth_token import verify_owner_based_auth_token
-from handlers.feishu import (handle_feishu_request, handle_send_message,
-                             handle_create_group, handle_remove_reaction,
-                             handle_add_reaction)
 from handlers.register import handle_register_request
 from handlers.responses import send_json, send_html_response
 from handlers.ws_handler import handle_ws_tunnel
@@ -46,7 +43,8 @@ class HttpRequestHandler(BaseHTTPRequestHandler):
     职责：解析请求、路由分发。
     业务逻辑委托给对应的 handler 模块：
         - Callback 后端路由 → handlers.callback
-        - 飞书网关路由 → handlers.register / handlers.feishu
+        - 注册路由 → handlers.register
+        - 平台端点与事件回调 → platforms 的 adapter
     """
 
     def log_message(self, format, *args):
@@ -114,9 +112,10 @@ class HttpRequestHandler(BaseHTTPRequestHandler):
         """处理 POST 请求
 
         路由分发逻辑：
-        1. 飞书网关侧路由（/gw/register, /gw/feishu/send）
-        2. Callback 后端侧路由（路由表匹配）
-        3. 飞书事件回调兜底（URL验证、消息事件、卡片回传交互）
+        1. 网关注册（/gw/register，平台无关）
+        2. 平台自有端点（adapter.gateway_routes()，统一 owner 鉴权）
+        3. Callback 后端侧路由（路由表匹配）
+        4. 平台事件回调兜底（adapter.handle_inbound_event）
         """
         parsed = urlparse(self.path)
         path = parsed.path
@@ -137,45 +136,23 @@ class HttpRequestHandler(BaseHTTPRequestHandler):
             send_json(self, 400, {'error': 'Invalid JSON'})
             return
 
-        # ===== 飞书网关侧路由 =====
+        # ===== 网关侧路由 =====
         if path == '/gw/register':
             client_ip = self.get_client_ip()
             handled, response = handle_register_request(data, client_ip)
             send_json(self, 200 if response.get('success') else 400, response)
             return
 
-        if path == '/gw/feishu/send':
-            binding = verify_owner_based_auth_token(self, data, '/gw/feishu/send')
+        # 平台自有端点：路径与处理器由 adapter 声明（gateway_routes），
+        # 路由层只做统一 owner 鉴权后分发，不认识具体平台
+        platform_handler = get_im_adapter().gateway_routes().get(path)
+        if platform_handler:
+            binding = verify_owner_based_auth_token(self, data, path)
             if binding is None:
                 return  # 验证失败，已发送响应
-            handled, response = handle_send_message(binding, data)
+            handled, response = platform_handler(binding, data)
             send_json(self, 200 if response.get('success') else 400, response)
             return
-
-        if path == '/gw/feishu/create-group':
-            binding = verify_owner_based_auth_token(self, data, '/gw/feishu/create-group')
-            if binding is None:
-                return
-            handled, response = handle_create_group(binding, data)
-            send_json(self, 200 if response.get('success') else 400, response)
-            return
-
-        if path == '/gw/feishu/remove-reaction':
-            binding = verify_owner_based_auth_token(self, data, '/gw/feishu/remove-reaction')
-            if binding is None:
-                return
-            handled, response = handle_remove_reaction(binding, data)
-            send_json(self, 200 if response.get('success') else 400, response)
-            return
-
-        if path == '/gw/feishu/add-reaction':
-            binding = verify_owner_based_auth_token(self, data, '/gw/feishu/add-reaction')
-            if binding is None:
-                return
-            handled, response = handle_add_reaction(binding, data)
-            send_json(self, 200 if response.get('success') else 400, response)
-            return
-
 
         # ===== Callback 后端侧路由 =====
         route_handler = BACKEND_ROUTES.get(path)
@@ -188,8 +165,9 @@ class HttpRequestHandler(BaseHTTPRequestHandler):
             send_json(self, status, response)
             return
 
-        # ===== 飞书事件回调（兜底：URL验证、消息事件、卡片回传交互）=====
-        handled, response = handle_feishu_request(data)
+        # ===== IM 平台事件回调（兜底：URL 验证、消息事件、卡片回传交互）=====
+        # 由当前平台 adapter 自行解析与分发，本层不感知平台细节
+        handled, response = get_im_adapter().handle_inbound_event(data)
         if handled:
             send_json(self, 200, response)
             return

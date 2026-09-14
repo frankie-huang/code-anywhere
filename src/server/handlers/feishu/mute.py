@@ -9,12 +9,12 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, List
 
+from platforms.models import IMEvent
 from utils.concurrency import run_in_background
 from services.session_facade import SessionFacade
 
 from .utils import (
     _SESSION_NOT_FOUND_HINT, _SESSION_UNRESOLVED_HINT,
-    _get_binding_from_event,
 )
 from .message import _send_notice_message
 
@@ -48,7 +48,7 @@ def _pick_mute_target(route_info: Dict[str, str], chat_id: str,
     return ''
 
 
-def _handle_mute_command(data: dict, args: str) -> None:
+def _handle_mute_command(event: IMEvent, args: str, binding: dict) -> None:
     """处理 /mute 命令：静音会话、目录或查看静音列表
 
     用法：
@@ -58,12 +58,9 @@ def _handle_mute_command(data: dict, args: str) -> None:
         /mute /path/**       — 递归静音指定目录及其所有子孙目录
         /mute list           — 查看所有静音和加白规则
     """
-    event = data.get('event', {})
-    message = event.get('message', {})
-    chat_id = message.get('chat_id', '')
-    message_id = message.get('message_id', '')
+    chat_id = event.chat_id
+    message_id = event.message_id
 
-    binding = _get_binding_from_event(event)
     if not binding:
         return
 
@@ -103,7 +100,7 @@ def _handle_mute_command(data: dict, args: str) -> None:
         return
 
     # 无参数 → 静音当前会话
-    route_info = SessionFacade.resolve_from_message(data, binding)
+    route_info = SessionFacade.resolve_from_message(binding, event)
     session_id = _pick_mute_target(route_info, chat_id, message_id)
     if not session_id:
         return
@@ -120,7 +117,7 @@ def _handle_mute_command(data: dict, args: str) -> None:
     run_in_background(_send_notice_message, (chat_id, text, message_id))
 
 
-def _handle_unmute_command(data: dict, args: str) -> None:
+def _handle_unmute_command(event: IMEvent, args: str, binding: dict) -> None:
     """处理 /unmute 命令：解除静音 / 标记目录为不静音
 
     用法：
@@ -129,12 +126,9 @@ def _handle_unmute_command(data: dict, args: str) -> None:
         /unmute /path          — 解除目录静音，或标记为不静音
         /unmute /path/**       — 解除目录递归静音，或标记目录及其所有子目录为不静音
     """
-    event = data.get('event', {})
-    message = event.get('message', {})
-    chat_id = message.get('chat_id', '')
-    message_id = message.get('message_id', '')
+    chat_id = event.chat_id
+    message_id = event.message_id
 
-    binding = _get_binding_from_event(event)
     if not binding:
         return
 
@@ -169,7 +163,7 @@ def _handle_unmute_command(data: dict, args: str) -> None:
         return
 
     # 无参数 → 解除当前会话静音
-    route_info = SessionFacade.resolve_from_message(data, binding)
+    route_info = SessionFacade.resolve_from_message(binding, event)
     session_id = _pick_mute_target(route_info, chat_id, message_id)
     if not session_id:
         return
@@ -283,11 +277,7 @@ def _send_mute_list_card(binding: Dict[str, Any], chat_id: str,
         return
 
     card_json = json.dumps(card, ensure_ascii=False)
-    success = False
-    if reply_to:
-        success, _ = service.reply_card(card_json, reply_to)
-    else:
-        success, _ = service.send_card(card_json, receive_id=chat_id, receive_id_type='chat_id')
+    success, _ = service.reply_or_send_card(card_json, chat_id, 'chat_id', reply_to)
 
     if not success:
         logger.error("[feishu] Failed to send mute list card, fallback to text")

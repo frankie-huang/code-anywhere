@@ -516,7 +516,7 @@ permission.sh SHALL 作为 Claude 和 Codex 的共享权限审批脚本，两种
 #### Scenario: Webhook 模式（默认）
 
 - **GIVEN** 用户配置 `FEISHU_SEND_MODE=webhook` 或未配置该变量
-- **AND** 未配置 `FEISHU_GATEWAY_URL`
+- **AND** 未配置 `GATEWAY_URL`
 - **WHEN** 系统需要发送飞书消息
 - **THEN** 使用 `FEISHU_WEBHOOK_URL` 通过 Webhook 发送
 - **AND** 不需要配置应用凭证
@@ -524,7 +524,7 @@ permission.sh SHALL 作为 Claude 和 Codex 的共享权限审批脚本，两种
 #### Scenario: OpenAPI 模式（单机）
 
 - **GIVEN** 用户配置 `FEISHU_SEND_MODE=openapi`
-- **AND** 未配置 `FEISHU_GATEWAY_URL`
+- **AND** 未配置 `GATEWAY_URL`
 - **AND** 配置了 `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET`
 - **AND** 配置了 `FEISHU_OWNER_ID`
 - **WHEN** 系统需要发送飞书消息
@@ -533,9 +533,9 @@ permission.sh SHALL 作为 Claude 和 Codex 的共享权限审批脚本，两种
 
 #### Scenario: 分离部署
 
-- **GIVEN** 用户配置了 `FEISHU_GATEWAY_URL`
+- **GIVEN** 用户配置了 `GATEWAY_URL`
 - **WHEN** 系统需要发送飞书消息
-- **THEN** POST 请求到 `${FEISHU_GATEWAY_URL}/gw/feishu/send`
+- **THEN** POST 请求到 `${GATEWAY_URL}/gw/feishu/send`
 - **AND** 网关负责实际的消息发送
 - **AND** Callback 服务无需配置飞书凭证
 
@@ -572,19 +572,19 @@ permission.sh SHALL 作为 Claude 和 Codex 的共享权限审批脚本，两种
 
 ### Requirement: 飞书网关分离部署支持
 
-系统 SHALL 支持将飞书网关与 Callback 服务分离部署，通过 `FEISHU_GATEWAY_URL` 配置启用分离部署。
+系统 SHALL 支持将飞书网关与 Callback 服务分离部署，通过 `GATEWAY_URL` 配置启用分离部署。
 
 #### Scenario: 检测分离部署
 
-- **GIVEN** 用户配置了 `FEISHU_GATEWAY_URL` 环境变量
+- **GIVEN** 用户配置了 `GATEWAY_URL` 环境变量
 - **WHEN** permission.sh 初始化
 - **THEN** 系统启用分离部署
-- **AND** 消息发送使用 `${FEISHU_GATEWAY_URL}/gw/feishu/send`
+- **AND** 消息发送使用 `${GATEWAY_URL}/gw/feishu/send`
 - **AND** 按钮 value 中包含 `callback_url: ${CALLBACK_SERVER_URL}`
 
 #### Scenario: 未配置时使用单机模式
 
-- **GIVEN** 用户未配置 `FEISHU_GATEWAY_URL`
+- **GIVEN** 用户未配置 `GATEWAY_URL`
 - **WHEN** permission.sh 初始化
 - **THEN** 系统使用原有的单机模式逻辑
 - **AND** 根据 `FEISHU_SEND_MODE` 决定消息发送方式

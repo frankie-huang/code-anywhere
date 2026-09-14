@@ -4,6 +4,165 @@ All notable changes to this project will be documented in this file.
 
 ## [Released]
 
+### Fixed - 2026-09-14
+
+#### Stop 竞态补全在有 jq 的机器上完全空转
+
+- **现象**：`supplement_last_message`（src/hooks/stop.sh）的 jq 分支在 `as $msg |` 之后漏了切回 `$resp`——jq 的 `as` 绑定不改变当前输入，`.texts` 对字符串取属性恒报 `Cannot index string`，被 `2>/dev/null` 吞掉后静默回落原 JSON，补全功能在有 jq 的机器上自落地（659c7af，2026-05-11）从未生效。日志佐证：落地当天重写定稿前有 50 次成功日志、此后四个月零命中（开发验证跑在重写前的旧形式上，提交的是重写后的形式）
+- **修复**：`as $msg |` 后补 `$resp |`（附注释说明 jq 语义陷阱）；幂等比较改为**两侧统一归一化后比较**（全空白 gsub/strip）——逐字节直接比较会误判重复追加：texts 元素已被提取器归一化而 last_msg 未归一化，且口径随格式/解析器而异（claude-jq 只去换行、python 全空白 strip、jq 机器上的 Codex 持久化 transcript 实际走 python 提取器），双侧归一化后比较与哪个提取器产出无关，前导换行、尾随空格、交叉路径案例均实证；归一化仅用于判空（纯空白 msg 不追加，对齐提取器的 `select(length > 0)`）与去重，**追加保留原文**——追加归一化值会丢首行缩进等首部空白（markdown 缩进代码块语义改变），且无 jq 的 python 路径原本就追加原文（review 发现）；jq 输出加 `-c` 与 python 单行输出对齐；回落分支补一行日志——解析器静默失败无留痕正是本 bug 潜伏四个月的放大器（parser 的 stderr 维持全仓统一的 `2>/dev/null` 丢弃口径，不为单点发明新风格）。函数级实测：追加补全（含首行缩进保留）、幂等、无 texts 键、分隔符内嵌、空 JSON 最小构造、jq/python 双分支等价，均正确
+- **测试取舍**：未固化单测——函数住在自执行的 hook 脚本里无常规测试入口（本次以 awk 抽数函数体 + stub 依赖完成验证；该方式对函数文本变化敏感，不宜固化为长期回归）；常规化需把 supplement 抽到 lib/transcript.sh，属另批重构
+
+#### Codex 撞锁降级丢失工作目录与 env 注入（c8d3ed8 的评审补充修复）
+
+- **现象**：`try_queue_fallback` 的 `subprocess.run` 未传 cwd——正常续聊的 `Popen` 传 `cwd=project_dir`，降级路径继承服务进程 cwd（实测为服务安装目录），`CODEX_COMMAND` 为相对路径（如项目内 `./codex-wrapper`）或 wrapper 内部依赖 `$PWD` 时降级必失败（127）；env overrides 与 `adapter.build_env` 同样未接。首轮评审已同时指出，当时以「queue 按 thread id 定位会话、不执行 turn」判不需要——该推理只覆盖会话定位层、漏了命令解析层（相对路径命令、wrapper 读 env），本轮一并补齐
+- **修复**：`try_queue_fallback` 增加 `project_dir` 参数（签名第三位，对齐 `launch_agent`）并以之为子进程 cwd，env 经 `adapter.build_env()` 构造（codex 当前为恒等实现，防将来 adapter 覆盖时降级路径漂移）；`build_queue_command_string` 末尾补 `prepend_env_overrides(session_id, ..., redact=debug)`（与 `build_command_string` 同构）。行为影响：无 env 快照/黑名单的配置零变化；**有 env 快照或 `SESSION_ENV_BLACKLIST` 的会话，降级命令会新增 `K=V` / `env -u` 前缀**（相对路径命令恢复解析，均为修复意图内）
+- **对齐核对**：shell 构建/模板/env overrides/cwd/build_env/进程组/管道/日志脱敏逐要素对齐 `launch_agent`；剩余差异均有意——queue 子命令无 `--skip-git-repo-check` 选项、30s 超时（瞬时命令）、不注入 hook 专用变量（queue 不跑 turn 无 hook 事件）
+- **验证**：`test_codex_queue_fallback.py` 增至 19 例（cwd 对齐、env 前缀注入、debug 下 env 值脱敏、build_env 返回值透传子进程），全量 207 过
+
+### Added - 2026-09-13
+
+#### /copy 指令：复制会话最后答复为 markdown 代码块
+
+- **需求**：回复会话消息发送 `/copy`（群聊会话模式下可群内直发），bot 以 markdown 代码块发出该会话**最后一条答复（stop message）的完整原文**——Stop 卡片正文是全部分段渲染 + 截断的结果，复制失真且混有中间叙述
+- **方案**：实时读 transcript（Python 侧不持有答复内容），经 `lib/transcript.sh` CLI 提取（前两批已铺好的提取库 + transcript_path 落库），与 Stop hook 共用同一解析器。CLI 退出码三态：0 = 有内容 / 2 = 无可提取内容（如轮次未落盘）/ 1 = 硬失败（文件缺失/不可读、解析器不可用、提取器执行失败），消费方据此区分「轮次尚未完成」与「读取失败」提示
+- **定位**：读 session 的 `transcript_path`（新增访问器 `get_transcript_path`，三态 None/空串/路径区分「会话不存在」与「路径未记录」；dissolved 不过滤——群解散≠transcript 失效，与 continue 读取口径一致）；缺路径/文件缺失给明确提示，前者发一条新消息即恢复
+- **取舍**：不存 turn_id——「取最近一轮答复」与需求字面一致，边缘场景（回复旧卡片且此后又跑完一轮）取到更新的一轮通常也符合意图；提取器的 turn_id 透传位保留，需要精确锚定时再补
+- **细节**：只取分段结果的最后一段（中间叙述不返回）；围栏带 markdown 标注且长度自适应（外层 = 最长反引号串 + 1，防嵌套断裂）；正文不截断，超长发送失败直接报错引导终端获取；结果消息不作为链式锚点（不更新 last_message_id、不写 MessageSessionStore，锚点保持在 stop 卡片）；协作者白名单放行（只读操作）
+- **已知边界**：① 运行中轮次发 /copy：Claude 可能取到半截/空（提示「轮次尚未完成」），Codex 自动命中上一完整轮；② 终端跑过本地斜杠命令后紧接 /copy 会误报空——本地命令记录被当成轮次起点，修复需 jq/python3 两实现同步排除，另批落地；③ 分离部署下卡片发送失败被网关降级为错误提示并返回成功，callback 的纯文本降级不触发（单机不受影响），网关既有行为另批评估
+- **验证**：新增 `test_transcript_copy.py` 16 例、`test_transcript_cli.py` 补 2 例、`test_session_transcript_path.py` 补 2 例，全量 204 过；真实 transcript 与飞书全链路实测
+
+#### hook 上报会话元数据（set-env 泛化为 set-meta）
+
+- **通道泛化**：`/cb/session/set-env` 改名 `/cb/session/set-meta`（旧路由直接移除不保留别名——调用方只有 Shell hook，随 `./setup.sh update` 与后端同步升级；开发期直接 `git pull`/切分支不重启服务会有短暂 404，上报 best-effort 丢失由下一 hook 事件自愈，可接受），`capture_session_env` → `report_session_meta`，payload 合并语义——按「字段是否存在」判断（缺失 = 不动，出现 = 更新，显式空串 = 清空），`session_id` 必带，`env` / `transcript_path` 字段存在时校验类型（null 同样 400，与旧接口一致）
+- **新增上报项 transcript_path**：hook 每次触发把 stdin 中的 transcript 路径上报后端，写入 `SessionChatStore` 新增的 `session.transcript_path` 字段（幂等覆盖、值不变跳过写盘、不存在的 session 不创建占位记录——与 set_env_overrides 同语义）；transcript 在 agent 本机、后端无法自行定位，落库后事后提取会话答复可直接读取（消费方见后续提交）
+- **行为变化**：原 `SESSION_ENV_WHITELIST` 为空时一个 POST 都不发；现在 transcript_path 几乎每个 hook 事件都有值，默认配置下变为每 hook 事件一次本机幂等上报
+- **已知边界（review 留档，不加机制）**：上报在 hook 路由前后台发起，与终端新会话的 ensure-chat 建记录存在竞态——session 尚不存在时上报丢弃（与 env 快照同源的既有行为）。不加重试/事件序号：正常会话有 UserPromptSubmit + Stop 多次 hook 事件，首次丢失通常由后续事件自愈（CLI 崩溃/强杀等无 Stop 的会话不保证）；多请求乱序覆盖仅 /compact 切文件的极窄窗口可触发，同样下一事件自愈
+- **验证**：新增 `tests/test_session_transcript_path.py` 8 例（store 3 例：占位拒绝、幂等覆盖、空串清空；handler 5 例：显式空串清空与缺失字段分离、非字符串 400、env null 400、env+path 同报合并）；curl 实测 set-meta 路由生效（占位 session 正确拒绝）
+
+### Refactored - 2026-09-13
+
+#### transcript 提取函数抽到 lib/transcript.sh（搬移零行为变化）
+
+- stop.sh 的 5 个提取函数（`is_codex_transcript` / `extract_claude_response` / `extract_codex_response` / `extract_response_from_file` / `extract_response`）原样迁至共享库 `src/lib/transcript.sh`，stop.sh 改为 `source` 引入；函数体逐字节一致（仅注释两处补充），Stop 通知链路行为零变化
+- 新增直接执行入口：`bash transcript.sh <path> [turn_id]`，单次提取（不重试、不回退 subagents——两者均为 Stop hook 落盘竞态的兜底，事后调用无意义），为后续按需提取会话答复的能力铺路；CLI 模式下 `log()` 经 core.sh 懒初始化照常落 `log/hook/`
+- 入口加固（review 采纳）：依赖加载的目录解析改 `cd+pwd`（`${BASH_SOURCE%/*}` 在相对路径调用时会拼出错误路径，实测 exit 1）；防重复加载与依赖检测由 `type` 改 `declare -F`（`type` 会命中 PATH 同名可执行文件，本库是唯一被直接执行的 lib，独立运行时无函数可匹配、PATH 碰撞面真实存在；仅被 source 的 callback.sh 等沿用 `type` 无此问题，不改），且守卫仅 sourced 模式生效——直接执行时若父 shell `export -f` 了同名函数，命中守卫的顶层 `return` 会报错污染 stderr
+- 验证：新增 `tests/test_transcript_cli.py` 4 例（绝对/相对路径调用、文件缺失退出码、Codex 持久化格式的 turn_id 切片），全量 176 过；另以真实 Claude transcript 验证 CLI 提取
+
+### Added - 2026-09-07
+
+#### Codex 会话锁冲突自动降级 codex queue 投递
+
+- **现象**：用户在终端/桌面端开着某 Codex 会话时，飞书回复该会话触发的 `codex exec resume` 会因会话已有活跃 writer 失败（`thread-store conflict: thread X already has an active writer`），消息无法送达且只收到错误通知
+- **方案**：exec resume 失败且错误匹配锁冲突特征时，降级为 `codex queue --thread <id> --message <prompt>` 把消息投递给运行中的会话（由其消费处理），飞书改发「会话正在其他窗口运行中，消息已加入该会话队列」提示，不再发错误通知与完成通知。锁冲突 ⟺ 有活跃 writer ⟺ 队列有人消费，降级语义自洽；会话已结束时 exec resume 不会锁冲突，主路径不受影响（实测 `codex queue` 对已结束会话同样 exit 0 但消息仅持久化入队、无人消费，故不可作为 resume 主路径）
+- **落点**：`AgentAdapter` 新增队列投递能力声明 `supports_queue`（默认 False）+ `CONCURRENT_SESSION_ERROR_MARKERS` 特征表（基类表驱动匹配 `is_concurrent_session_error`，子类只填表；命名只描述错误事实、不携带响应方式）+ `build_queue_command_string()`（默认 None）；CodexAdapter 声明并实现，queue 命令与 exec 路径同构地走 `CODEX_ARGS_TEMPLATE`（wrapper 配置下降级同样可用，默认模板下展开与直拼逐字相同）；降级动作收敛在 callback 侧续聊路径——错误回调处内联降级分支（局部闭包携带本次 prompt/command，锁冲突时先 `try_queue_fallback()` 投递并发 📌，否则走原 `_send_error_notification`）；`_check_and_monitor` 快速失败时借 `notification_handled` 通道让网关静默（同 /compact 快速完成语义），避免与 callback 侧通知重复。降级失败（如 CLI <0.149 无 queue 子命令）回落原错误通知，无需版本特判
+- **实测反馈修正**（首版三处）：① 网关侧响应状态分发未识别降级状态，落到"未知的响应状态"兜底发 ⚠️ 与 callback 侧 📌 重复；② `_send_queued_notification` 误清 `skip_next_user_prompt` 标志，导致队列消息被运行中会话消费时 user_prompt hook 把飞书已展示的 prompt 又回显一次——不清该标志，与正常 exec resume 路径共用同一去重机制（stop 通知保留，飞书问的问题在飞书收完成通知）；③ 首版为降级新引入 `on_queued` 回调通道（贯穿 `launch_agent`/`_check_and_monitor`/`_monitor_startup` 三处签名 + 网关新状态分支），复盘后判定过度设计并回退：降级判定与投递不需要新通道，`_monitor_startup` 与网关侧 `feishu/message.py` 完全无改动（后台失败路径网关早已收 processing，本就不会重复发）
+- **取舍**：未采用「`exec resume ... || codex queue ...` 纯 shell 兜底」（只需改 codex.py）——`||` 对任何失败都触发，API 报错等场景 prompt 已写入 rollout，再投递即重复；且 queue 成功会让整条命令 exit 0，监控层误判为执行成功
+- **已知边界**：① codex queue 异步机制固有——turn 失败无感知（queue 路径没有进程退出码信号源）、终端关闭时消息滞留 `queue_1.sqlite` 下次 resume 补投且时机不可控；② 多消息回显——`skip_next_user_prompt` 为单布尔，锁冲突期间连发多条飞书消息时第二条起会被回显（规避：等 📌 回执后再发下一条；根治需标志改计数，涉及 hook 链路共享状态，另立项）；③ 降级投递跑在异步回调内，`_check_and_monitor` 先于投递结果返回 completed（"callback 负责最终通知"契约的既有形态，queue 失败仍会正确送达原错误通知，不吞错）；④ queue 命令未走 `prepend_env_overrides`（env 快照对不执行 turn 的 queue 无作用点；已兼容 `CODEX_ARGS_TEMPLATE`，wrapper 配置可用）
+- **特征匹配收窄**（评审采纳）：只保留精确特征 `already has an active writer`（真实撞锁错误全文取自 `~/.codex/logs_2.sqlite` 实录），弃用宽前缀 `thread-store conflict` 单独匹配——若未来出现非 writer 的 thread-store 冲突（如 store 损坏），误判为锁冲突会把消息投进无消费者的队列静默滞留，破坏「锁冲突 ⟺ 队列有人消费」的自洽性
+- **验证**：新增 `tests/test_codex_queue_fallback.py` 16 例（真实错误命中、宽前缀单独出现不命中、prompt 含引号换行的 quoting round-trip、debug 脱敏、能力声明正反例、wrapper 模板组装、try_queue_fallback 四种回落分支与投递成功分支，mock subprocess.run 不真调 CLI），全量 172 过（含 4 例 e2e，非 e2e 为 168）；另以模拟锁冲突错误端到端验证降级真实执行 `codex queue` 且消息落入 `~/.codex/queue_1.sqlite`。代码评审两轮（codex 一轮、另一 agent 一轮）：异步回调时序与"回调内同步≠调用链同步"的契约问题经复核确认，与仓库既有双重 drain 权衡同类，按已知边界留档；特征收窄与补测为第二轮评审采纳项
+
+### Refactored - 2026-09-01
+
+#### 出站 HTTP 超时常量归一（行为零变化）
+
+- `HTTP_TIMEOUT = 10` 此前在 4 个文件各自本地定义（`register` / `callback_client` / `feishu_api` / `auto_register`），统一为 `utils/http_client.DEFAULT_HTTP_TIMEOUT` 并作为 `post_json` 默认值，消除各自漂移的可能。`telemetry` 的 5s 为有意区别（遥测不拖慢主流程）、`permission_mcp` 的 600s 是审批等待超时，均不涉
+- 顺带清理 `auto_register.py` 两处 pyflakes 既有告警（unused `List` import、无占位符 f-string）
+
+#### 决策转发内核收口与卡片回调职责归位（行为零变化）
+
+- **决策内核**：`services/callback_client.py` 新增 `forward_decision()`——`/cb/decision` 的传输与 `success/decision/message` 三元组解析收口为单一实现（此前权限审批与问卷回答两处各自手写、逐字重复），toast/卡片/Typing 等呈现语义仍归调用方
+- **职责归位**：权限审批决策处理（原 `forward.py` 的 `_forward_permission_request`）迁入 `card_action.py` 并更名 `_handle_permission_decision`，与问卷回答 `_handle_ask_question_answer` 并列——`card_action.py` 完整承载卡片回调业务（总入口分派 → 权限/问卷/表单 → 状态更新），`forward.py` 回归「消息/命令触发的网关→Callback 转发」。此前的归类交叉（按机制 vs 按业务）源于 Issue 1 大文件拆包，`card_action → forward` 的包内横向 import 一并消除
+- **验证**：E2E 权限黄金路径真实经过迁移后的函数（4/4），全量单测通过；`forward_decision` 探针验证三元组解析与 None 语义
+
+### Fixed - 2026-09-01
+
+#### 注册通知失败被静默吞掉，notify 失败仍落盘新 token 导致两侧错位
+
+- **现象**：HTTP 回调模式下，网关向 Callback 重发 auth_token 的 `notify_register_callback` 全程吞异常、返回 `None`，调用方无从判断成败；两个调用点（同 callback_url 续期、授权卡片批准）在 notify 失败后仍无条件落盘新 token——网关持新 token、Callback 持旧 token，此后所有 `/cb/*` 转发 401。授权卡片批准分支另有假成功：先落盘后 notify，失败仍渲染绿色「✓ 已授权」
+- **修复**：`notify_register_callback` 改返回 `-> bool`（400 业务拒绝与网络异常均返回 False）；两个调用点改为 notify → 确认 → upsert，notify 失败即跳过落盘（两侧保持旧 token 一致，残留错位由下次重启重注册自愈）；授权卡片分支补 store 前置确认（不可用则不发起 notify，避免 Callback 单侧持 token），`upsert()` 返回值不再丢弃。四处失败响应收敛为 `_fail()` 辅助函数，颜色语义固定（yellow = 可重试的操作性失败、red = 需管理员介入的配置/存储故障），此前 `FEISHU_APP_SECRET` 缺失只弹 toast 不更新卡片的漏网一并补上
+- **取舍**：评估后未引入同 URL 续期的幂等重放与批准串行锁——notify 与 `/cb/*` 转发同向，该方向持续不通时 HTTP 模式整体不可用，为模糊场景（响应丢失、卡片重投交错）叠加机制成本高于收益（详见 TODO 留档）
+- **测试**：新增 `tests/test_register_two_phase.py` 8 例，覆盖续期 notify 成功/失败/upsert 失败、授权批准成功/黄卡/红卡/配置缺失/store 前置拦截
+
+### Fixed - 2026-08-31
+
+#### 响应中未知 agent_type 炸掉网关通知线程
+
+- **现象**：`message.py` 渲染通知/卡片时直接 `get_agent_adapter(agent_type or None).display_name`，而 `get_agent_adapter` 对非 `VALID_AGENTS` 的值抛 `ValueError`。`agent_type` 来自 callback 响应或历史 session 记录，跨版本可能带非白名单值；该调用点在后台通知线程里，异常不被 HTTPError/URLError 捕获，线程死亡、用户收不到任何通知（空值走 `DEFAULT_AGENT`，已有白名单兜底，不受影响）
+- **修复**：`agents` 新增 `get_agent_display_name(agent_type, default='Agent')`，非白名单值降级为通用名并记 warning；`message.py` 两处取产品名（会话结果通知、"正在创建会话"卡片）统一改调它——此前只有前者被发现，后者是同形态的漏网
+
+### Fixed - 2026-08-30
+
+#### 服务重启继承 per-prompt 环境变量，卡片串到别的群
+
+- **现象**：从飞书私聊 `/new` 拉起的新会话，权限审批卡片发到了另一个会话所在的群
+- **根因**：`launch_agent` 向 agent 子进程注入的 `CODE_ANYWHERE_MESSAGE_ID` / `CODE_ANYWHERE_SENDER_ID` 是 per-prompt 值。若在 agent 会话内重启服务（如让 agent 跑 `./setup.sh restart`），server 会从该会话的 shell 继承这两个变量并停留在 `os.environ` 中；而注入是条件式的（`if message_id:`），P2P `/new` 按设计清空 `message_id`（见 `64527e8`）时不覆盖，继承来的脏值就原样传给了新会话，hook 据此把卡片 reply 到了旧会话的消息上，也就落进了旧会话的群
+- **触发条件**：需要「会话内重启服务」与「message_id 为空的启动路径（P2P `/new` 建新群）」两个条件同时满足，因此此前未暴露
+- **修复**：`launch_agent` 注入前无条件 `env.pop` 这两个变量，切断继承。收口在注入点：写入与清除同处一地，新增 per-prompt 变量时不会漏（server 启动侧无从感知该注入哪些变量，不做对称处理）
+
+### Refactored - 2026-08-29
+
+#### Python Server 层抽象出 IM 平台适配层（platforms/），业务层去平台化
+
+- **背景**：与 Shell 层同源的问题——`handlers/feishu` 各自重复挖掘飞书事件 JSON、`services` 层直读平台报文、注册/授权/出站散落 `FEISHU_*` 直读，接入第二个 IM 平台需要改每个消费方。本条为 Python 侧收口（Shell 侧见 2026-08-09 条目），正常链路**零行为变化**（差异清单见下）
+- **新增 `platforms/` 包**：`IMAdapter` 抽象（接口按强制力分档：必备 / 条件必备 / 可选 / 能力混入）+ `get_im_adapter()` 工厂（按 `IM_PLATFORM` 实例化，默认 feishu）；入站事件中立模型 `IMEvent`（消息/卡片共用一结构，kind 区分，`raw` 只读保留）；`feishu_adapter.py` 为飞书实现
+- **五条通路收口**：生命周期（`initialize_runtime` / `shutdown_runtime` / `cleanup_expired_data`）；Callback 侧出站（`cb_*` 系列，单机直发/经网关由 adapter 内部决定）；注册授权（`start_authorization` / `start_ws_authorization` / `get_auth_secret` / `default_binding_params`，授权的飞书形态拆出 `handlers/feishu/authorization.py`，`register.py` 1282 → 363 行只留平台无关编排）；入站事件（`parse_event` 解析为 `IMEvent`，消息/卡片/命令/审计日志/`SessionFacade` 全链路只读事件属性）；群聊（`GroupCapable` 混入 + `services/group_maintenance.py` 平台无关编排）
+- **传输层中立模块**：`services/callback_client.py`（网关→Callback，WS 隧道/HTTP 双通道 + 注册通知）与 `gateway_client.py`（Callback→网关）对称成对，双向反向依赖消除
+- **路由层去平台化**：`http_handler` 硬编码的四条 `/gw/feishu/*` 分支改为由 `adapter.gateway_routes()` 声明端点表，路由层只做统一 owner 鉴权后分发；事件回调兜底改调 `adapter.handle_inbound_event`，`http_handler.py` 对飞书零引用
+- **隐式通道消灭**：`event['_effective_binding']`、`message['plain_text']`、`message['is_at_bot']` 三条 raw dict 隐式通道删除，binding 沿调用链显式传参
+- **附带性能净收益**：命令路径 3 次 binding 查询（每次全量读盘）收敛为 1 次
+- **长连接注入**：`start_feishu_longpoll` 的 `event_handler` 改必传，`feishu_longpoll.py` 成为纯 SDK 封装、对 `handlers` 零依赖
+- **新增平台的改动面**：实现 `<platform>_adapter.py`（按能力混入 `GroupCapable`）+ 工厂注册一行，业务层零改动
+- **配置键归化**（随 `365e8d1` / `b68362b`）：`FEISHU_GATEWAY_URL` → `GATEWAY_URL`、连接方式导出符号 → `GATEWAY_MODE`——网关地址由部署拓扑决定、与 IM 平台无关；旧键继续生效（两者都配时新键优先），Shell 与 Python 两侧同步解析
+- **已知微小差异**（均为诊断级或错误路径，正常链路无用户可见变化）：sender 缺 `user_id` 时回退 `open_id`（卡片路径及 `/new`、`/reply`、默认聊天目录三处消息路径，stop 卡片 @ 对象随之可命中）；单机直发抛异常不再回落本地网关重试（单机下重试必然同样失败，失败串变为原始异常串）；网关代发错误串 `no feishu service available` → `no gateway configured`；Typing 网关代发失败由静默改为 warning；`parse_event` 先于 token 校验执行（未验签请求也会跑一遍解析，仅 CPU 面、无副作用）；长连接异常日志文案与若干日志格式变化。收尾复查修正：webhook 重复告警、网关响应异常兜底范围、owner 读取经 adapter、注册默认值组装去重（`default_binding_params` + 共享 `build_binding_params()`）
+- **等价性验证**：`parse_event` 与收口前逐字段等价基线（`tests/test_feishu_event_parse.py`，含变异测试验证测试网有效）；消息/卡片/session 路由/审计日志各场景与改造前逐项对照一致；单测 90 → 144
+
+### Fixed - 2026-08-15
+
+#### reply_to 指向不可用消息时整条通知丢失
+
+- **背景**：hook 透传的 `reply_to`（`CODE_ANYWHERE_MESSAGE_ID` 或 `last_message_id`）可能指向本网关不可用的消息——网关切换后跨租户、消息已被撤回等。这类 ID 走 reply API 必然失败，且失败后没有降级路径，导致权限卡片、完成通知等整条消息丢失
+- **修复**：`FeishuAPIService` 新增 `reply_or_send_card / reply_or_send_text / reply_or_send_post` 封装，reply 失败时记录 warning 并降级为按 `receive_id` 发送新消息。全部 12 处 `if reply_to: reply_xxx else: send_xxx` 分支统一收敛到该封装：`/gw/feishu/send`（card/text/post 及卡片失败的文本降级，4 处）、网关内部通知（`_send_text_message`、目录选择/帮助/状态/群列表/静音卡片，6 处）、callback 侧 outbound（`reply_feishu_text` / `reply_feishu_markdown` 单机路径，2 处）
+- **降级形态**：降级消息不丢，但会脱离线程关联、直接出现在群聊主界面——原 reply 带 `reply_in_thread=True`（收进话题、不刷群聊）的场景，降级后会刷到主界面，权限审批卡片这类形态变化明显。这是 send 新消息没有话题概念的固有限制，不做进一步补偿
+- **取舍**：以真实 API 结果为准而非本地 `MessageSessionStore` 预判——store 过期/被清不代表消息不可回复，误判会把本可成功的 reply 降级。代价是坏场景下多一次注定失败的 API 调用，及 reply 超时但服务端实际成功时极小概率的重复消息
+
+### Fixed - 2026-08-15
+
+#### 服务优雅关闭在 stop/restart 路径下不生效
+
+- **背景**：`main.py` 只捕获 KeyboardInterrupt（SIGINT），而 `start-server.sh` 停服务用的是 `kill`（SIGTERM）。Python 默认对 SIGTERM 直接终止进程、不解栈不执行 finally，因此 `./setup.sh stop/restart` 时 WS 关闭通知、`stop_ws_tunnel_client`、飞书长连接停止全都不会执行——此前这类「优雅关闭」日志一条都没出现过。另有两处叠加缺陷：`stop_feishu_longpoll` 位于 `_shutdown_ws_connections` 尾部，纯网关部署（无 WS 连接）时被提前 return 挡住，长连接漏关；`stop_ws_tunnel_client` 同样被挡住，分离部署的 Callback（只有出站隧道）也漏关
+- **修复**：注册 SIGTERM handler 转成 KeyboardInterrupt 复用同一退出路径；关闭逻辑收进 `_graceful_shutdown`（每步独立 try、清理期间忽略后续 SIGTERM、HTTP 服务用 `server_close` 而非会死锁的 `shutdown`）；初始化主体抽成 `_run_server`，try/finally 覆盖全程；关闭动作拆为通知入站连接 / 停出站隧道 / 停长连接三个独立步骤
+- **顺带**：长连接停止的 join 超时 5s → 2s（lark SDK 内部连接常无法被 close 打断，线程要等满超时；它是 daemon 线程，进程退出即回收，等更久无收益）；`start-server.sh` 停止等待窗口 5s → 15s（正常关闭约 3.5s，窗口为异常路径的 join 超时留余量），停止等待改为逐秒输出进度点，按结果输出 `done.` / `timeout.`
+- **实测**：修复前 SIGTERM 下无任何 shutdown 日志；修复后 restart 可见完整关闭链（通知 WS → 隧道客户端停止 → 长连接停止，约 3.5s），对端收到通知后 `will reconnect immediately`（否则按 1~60s 指数退避重连，恢复窗口拉长一个数量级）
+
+### Changed - 2026-08-15
+
+#### 服务文案更正：Callback Server 命名与过时的脚本引用
+
+- 服务实际承载 20+ 路由（会话管理、Agent 启停、目录、通知配置、群聊），权限审批只是其一，`Permission Callback Server` 命名以偏概全。统一改为 `Callback Server`，与既有 `/cb/*` 路由前缀、`CALLBACK_SERVER_PORT` 配置键、`log/callback/` 目录自洽
+- 修正 7 处对早已不存在的 `hooks/permission-notify.sh` 的引用（实际为 `hooks/permission.sh`）；`main.py` 模块 docstring 的功能描述同步改为如实反映服务职责，权限流程降为其中一节
+
+### Refactored - 2026-08-09
+
+#### Shell Hook 层抽象出 IM 平台中间层，飞书实现下沉
+
+- **背景**：三个 Hook 脚本直读 `FEISHU_SEND_MODE` / `FEISHU_WEBHOOK_URL` / `FEISHU_OWNER_ID`，直接调 `build_permission_card` / `build_stop_card` / `send_feishu_card` / `_resolve_chat_id`，「与后端通信」「与飞书通信」两件事完全缠在一起。接入第二个 IM 平台需要改动每个 Hook
+- **新增 `src/lib/callback.sh`**：从 `feishu.sh` 抽出与 IM 平台无关的 Callback 后端客户端——HTTP 请求（`do_curl_post` / `do_callback_post`）、凭证（`get_auth_token`）、网关地址解析（`get_gateway_url`）、会话查询与上报（`query_chat_id` / `check_skip_user_prompt` / `capture_session_env`）、Agent 展示信息，以及 `MUTED_SENTINEL` / `HTTP_TIMEOUT` / `CALLBACK_SERVER_URL` 等常量。搬移时函数体逐字节不变
+- **新增 `src/lib/im.sh`**：Hook 与平台之间的唯一接口层。读 `IM_PLATFORM`（默认 feishu）加载 `callback.sh` + 对应平台实现，对外暴露 `im_channel_ready` / `im_get_owner_id` / `get_chat_id` / `send_user_prompt_notification` / `send_permission_notification` / `send_ask_question_notification` / `send_stop_notification`。未知平台 fail-fast 并同时输出 stderr（`log_error` 只写日志文件，仅靠它会导致配置错误后所有 Hook 静默失效）
+- **飞书实现下沉**：`feishu.sh` 新增 `_feishu_send_*` 系列承接卡片构建与发送，`build_response_elements` 从 `stop.sh` 迁入。三个 Hook 不再出现任何飞书标识
+- **策略与渲染分离**：`_build_at_user_tag` 拆为 `resolve_at_target`（判定该 @ 谁，5 级优先级，平台无关）+ 飞书 at 标签渲染；`build_response_elements` 拆为 `build_response_content`（按长度截断 texts、标记 truncated）+ 卡片元素渲染。`STOP_MESSAGE_MAX_LENGTH` 随之只出现在 `stop.sh`，与 `STOP_THINKING_MAX_LENGTH` 对称
+- **命名对齐**：`callback.sh` 12 个被跨文件调用的函数去掉 `_` 前缀，符合仓内既有约定（无 `_` = 模块公开 API）；`_get_chat_id` 与 `im.sh` 的 `get_chat_id` 派发入口撞名会递归，改名为 `query_chat_id`
+- **新增平台的改动面**：新建 `src/lib/<platform>.sh` 实现 `_<platform>_*` 系列，在 `im.sh` 各 `case` 注册，Hook 脚本零改动
+- **配置**：新增 `IM_PLATFORM`（默认 feishu，当前仅支持 feishu）
+- **等价性**：逐条通路与改造前基线比对——permission 5 场景（交互/muted/降级/AskUserQuestion/questions 为空）、stop 5 场景（正常/muted/空 transcript/禁用 thinking/超长截断）、user_prompt 3 场景，落到假网关的请求序列与 payload 逐字节一致；at 判定 13 种优先级组合、截断与渲染 11 组用例 × jq/python3 双解析路径分别比对一致；全程单测 90/90、E2E 4/4
+
+### Fixed - 2026-08-09
+
+#### stop 通知的 muted 会话漏拦与卡片会话定位错误
+
+- **背景**：`SESSION_ID` 原从 `response_json` 派生（`extract_response` 的产物），与 Stop 事件自带的 session_id 冗余；transcript 提取失败时 `SESSION_ID` 为空，导致其后的 mute 检查整块被跳过
+- **修复**：`SESSION_ID` 直接取自 Stop 事件输入，与 `permission.sh` / `user_prompt.sh` 写法对齐，删除 `INPUT_SESSION_ID` 与 response_json 派生两处冗余。muted 会话现在无论 transcript 是否提取成功都被正确拦截；空响应时的兜底卡片也不再带着空 session/chat 发出（原先无法投递到正确会话）
+- **顺带**：mute 检查前移到 `extract_response` 之前，muted 时省掉 transcript 读取与 jq/python 解析
+
 ### Refactored - 2026-08-03
 
 #### Claude / Codex hook 配置逻辑合并到 JsonHookConfigurator 基类
